@@ -910,6 +910,35 @@ body::after {
     color: var(--text-secondary);
     word-break: break-word;
     max-width: 320px;
+    text-align: right;
+}
+
+.rate-row.route-row {
+    align-items: flex-start;
+}
+
+.route-leg {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 1px 0;
+    font-size: 11px;
+    line-height: 1.4;
+}
+
+.route-leg-pair {
+    color: var(--text-secondary);
+    white-space: nowrap;
+}
+
+.route-leg-lp {
+    color: var(--accent);
+    white-space: nowrap;
+}
+
+.route-leg-rate {
+    color: var(--text-muted);
+    white-space: nowrap;
 }
 
 /* ============================================

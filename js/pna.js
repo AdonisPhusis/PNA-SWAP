@@ -40,6 +40,40 @@ const ASSETS = {
         addressPattern: /^[xy][a-zA-HJ-NP-Z0-9]{33}$/,
         addressPlaceholder: 'y...',
     },
+    PIVX: {
+        symbol: 'PIVX',
+        name: 'PIVX',
+        icon: 'P',
+        network: 'PIVX Testnet',
+        decimals: 8,
+        color: '#6b3fa0',
+        addressPattern: /^[yY][a-zA-HJ-NP-Z0-9]{25,34}$/,
+        addressPlaceholder: 'y...',
+        disabled: true,
+        disabledReason: 'Awaiting faucet',
+    },
+    DASH: {
+        symbol: 'DASH',
+        name: 'Dash',
+        icon: 'D',
+        network: 'Dash Testnet',
+        decimals: 8,
+        color: '#008ce7',
+        addressPattern: /^[yY][a-zA-HJ-NP-Z0-9]{25,34}$/,
+        addressPlaceholder: 'y...',
+    },
+    ZEC: {
+        symbol: 'ZEC',
+        name: 'Zcash',
+        icon: 'Z',
+        network: 'Zcash Testnet',
+        decimals: 8,
+        color: '#f4b728',
+        addressPattern: /^t[a-zA-HJ-NP-Z0-9]{34}$/,
+        addressPlaceholder: 'tm...',
+        disabled: true,
+        disabledReason: 'Awaiting faucet',
+    },
 };
 
 // Mock rates (relative to USD)
@@ -47,6 +81,9 @@ const MOCK_RATES = {
     BTC: 98500,
     USDC: 1,
     M1: 1,  // M1 pegged to M0 which tracks USD via settlement
+    PIVX: 0.25,
+    DASH: 28,
+    ZEC: 35,
 };
 
 // =============================================================================
@@ -62,6 +99,7 @@ const CONFIG = {
     ],
     STATUS_REFRESH_MS: 5000,
     QUOTE_REFRESH_MS: 10000,
+    LP_TIMEOUT_MS: 4000,
     MIN_AMOUNT: 0.0001,
     MAX_AMOUNT: {
         BTC: 1.0,
@@ -330,14 +368,16 @@ function openAssetModal(target) {
     for (const [symbol, asset] of Object.entries(ASSETS)) {
         const isSelected = symbol === currentAsset;
         const isOtherSide = symbol === otherAsset;
+        const isDisabled = asset.disabled;
 
         html += `
-            <div class="asset-item ${isSelected ? 'selected' : ''}"
-                 onclick="selectAsset('${symbol}')">
-                <span class="asset-item-icon" style="color: ${asset.color}">${asset.icon}</span>
+            <div class="asset-item ${isSelected ? 'selected' : ''} ${isDisabled ? 'disabled' : ''}"
+                 ${isDisabled ? '' : `onclick="selectAsset('${symbol}')"`}
+                 ${isDisabled ? 'title="' + (asset.disabledReason || 'Unavailable') + '"' : ''}>
+                <span class="asset-item-icon" style="color: ${asset.color}${isDisabled ? '; opacity: 0.4' : ''}">${asset.icon}</span>
                 <div class="asset-item-info">
-                    <span class="asset-item-name">${asset.name}</span>
-                    <span class="asset-item-network">${asset.network}</span>
+                    <span class="asset-item-name" ${isDisabled ? 'style="opacity: 0.5"' : ''}>${asset.name}</span>
+                    <span class="asset-item-network">${isDisabled ? asset.disabledReason : asset.network}</span>
                 </div>
                 ${isSelected ? '<span class="asset-item-check">&#10003;</span>' : ''}
                 ${isOtherSide ? '<span class="asset-item-swap">&#8644;</span>' : ''}
@@ -479,7 +519,7 @@ async function fetchLPInfo() {
         // Query all LPs in parallel
         const results = await Promise.allSettled(
             CONFIG.SDK_URLS.map(url =>
-                fetch(`${url}/api/lp/info`, { signal: AbortSignal.timeout(15000) })
+                fetch(`${url}/api/lp/info`, { signal: AbortSignal.timeout(CONFIG.LP_TIMEOUT_MS) })
                     .then(r => r.ok ? r.json() : null)
                     .then(data => data ? { ...data, _url: url } : null)
             )
@@ -524,7 +564,7 @@ async function fetchQuote(fromAsset, toAsset, amount) {
 
         const results = await Promise.allSettled(
             CONFIG.SDK_URLS.map(url =>
-                fetch(quoteUrl(url), { signal: AbortSignal.timeout(15000) })
+                fetch(quoteUrl(url), { signal: AbortSignal.timeout(CONFIG.LP_TIMEOUT_MS) })
                     .then(async r => {
                         if (!r.ok) {
                             const error = await r.json().catch(() => ({}));
@@ -610,7 +650,7 @@ async function fetchLegQuotes(fromAsset, toAsset, amount) {
     const results = await Promise.allSettled(
         CONFIG.SDK_URLS.map(url =>
             fetch(`${url}/api/quote/leg?from=${fromAsset}&to=${toAsset}&amount=${amount}`,
-                { signal: AbortSignal.timeout(15000) })
+                { signal: AbortSignal.timeout(CONFIG.LP_TIMEOUT_MS) })
                 .then(async r => {
                     if (!r.ok) return null;
                     const data = await r.json();
@@ -650,8 +690,27 @@ async function fetchPerLegRoute(fromAsset, toAsset, amount) {
 
         // Leg 2: M1 → to (use leg 1 output as input)
         const leg2Quotes = await fetchLegQuotes('M1', toAsset, bestLeg1.to_amount);
-        const bestLeg2 = selectBestLeg(leg2Quotes);
+        let bestLeg2 = selectBestLeg(leg2Quotes);
         if (!bestLeg2) return null;
+
+        // Same-LP bias: prefer keeping both legs on the same LP when the
+        // difference is negligible (< 0.1%). Single-LP is simpler and more
+        // reliable (1 atomic swap vs 2 coordinated legs).
+        if (bestLeg1.lp_id !== bestLeg2.lp_id) {
+            const sameLpLeg2 = leg2Quotes.find(q =>
+                q.lp_id === bestLeg1.lp_id && q.inventory_ok !== false
+            );
+            if (sameLpLeg2) {
+                const diff = Math.abs(
+                    parseFloat(bestLeg2.to_amount) - parseFloat(sameLpLeg2.to_amount)
+                );
+                const threshold = parseFloat(bestLeg2.to_amount) * 0.001; // 0.1%
+                if (diff <= threshold) {
+                    console.log(`[pna] Same-LP bias: keeping ${bestLeg1.lp_name} for both legs (diff=${diff.toFixed(4)})`);
+                    bestLeg2 = sameLpLeg2;
+                }
+            }
+        }
 
         return {
             type: 'perleg',
@@ -816,7 +875,34 @@ async function updateRateDisplay() {
         }
 
         DOM.rateValue.textContent = rateStr;
-        DOM.routeValue.textContent = quote.route;
+        // Route display: detailed per-leg or simple
+        if (State.routeLegs && State.routeLegs.leg1 && State.routeLegs.leg2) {
+            const l1 = State.routeLegs.leg1;
+            const l2 = State.routeLegs.leg2;
+            const r1 = parseFloat(l1.rate || 0);
+            const r2 = parseFloat(l2.rate || 0);
+            // Format leg rate: show inverted when < 0.01 (e.g. 1 USDC = 1,490 M1)
+            function fmtLegRate(r, from, to) {
+                if (r >= 100) return formatNumber(r, 0);
+                if (r >= 0.01) return r.toFixed(4);
+                // Tiny rate — show inverted for readability
+                const inv = 1 / r;
+                return `1 ${to}=${formatNumber(inv, 0)} ${from}`;
+            }
+            DOM.routeValue.innerHTML =
+                `<div class="route-leg">` +
+                    `<span class="route-leg-pair">${l1.from_asset} \u2192 ${l1.to_asset}</span>` +
+                    `<span class="route-leg-lp">${l1.lp_name}</span>` +
+                    `<span class="route-leg-rate">${fmtLegRate(r1, l1.from_asset, l1.to_asset)}</span>` +
+                `</div>` +
+                `<div class="route-leg">` +
+                    `<span class="route-leg-pair">${l2.from_asset} \u2192 ${l2.to_asset}</span>` +
+                    `<span class="route-leg-lp">${l2.lp_name}</span>` +
+                    `<span class="route-leg-rate">${fmtLegRate(r2, l2.from_asset, l2.to_asset)}</span>` +
+                `</div>`;
+        } else {
+            DOM.routeValue.textContent = quote.route;
+        }
         // Settlement = M1 rail (~1 min), BTC finality = separate
         const m1Finality = (quote.confirmations_breakdown && quote.confirmations_breakdown.m1_finality) || 60;
         DOM.timeValue.textContent = `~${Math.ceil(m1Finality / 60)} min (M1 rail)`;
@@ -882,39 +968,43 @@ async function onInputChange() {
     }
 
     inputDebounceTimer = setTimeout(async () => {
-        // Fetch real quote from SDK
-        State.outputAmount = await calculateOutput(value);
+        try {
+            // Fetch real quote from SDK
+            State.outputAmount = await calculateOutput(value);
 
-        // Check for errors (min/max)
-        if (currentQuote && currentQuote.error === 'min') {
-            DOM.outputAmount.textContent = `Min: ${formatNumber(currentQuote.minAmount, 2)} ${currentQuote.asset}`;
-            updateButtonState();
-            return;
-        }
-        if (currentQuote && currentQuote.error === 'max') {
-            DOM.outputAmount.textContent = `Max: ${formatNumber(currentQuote.maxAmount, 2)} ${currentQuote.asset}`;
-            updateButtonState();
-            return;
-        }
+            // Check for errors (min/max)
+            if (currentQuote && currentQuote.error === 'min') {
+                DOM.outputAmount.textContent = `Min: ${formatNumber(currentQuote.minAmount, 2)} ${currentQuote.asset}`;
+                updateButtonState();
+                return;
+            }
+            if (currentQuote && currentQuote.error === 'max') {
+                DOM.outputAmount.textContent = `Max: ${formatNumber(currentQuote.maxAmount, 2)} ${currentQuote.asset}`;
+                updateButtonState();
+                return;
+            }
 
-        // Format output based on asset decimals
-        const toAsset = ASSETS[State.toAsset];
-        const displayDecimals = State.outputAmount >= 1000 ? 2 : (toAsset.decimals > 4 ? 4 : toAsset.decimals);
-        DOM.outputAmount.textContent = formatNumber(State.outputAmount, displayDecimals);
+            // Format output based on asset decimals
+            const toAsset = ASSETS[State.toAsset];
+            const displayDecimals = State.outputAmount >= 1000 ? 2 : (toAsset.decimals > 4 ? 4 : toAsset.decimals);
+            DOM.outputAmount.textContent = formatNumber(State.outputAmount, displayDecimals);
 
-        // Update rate info with actual amount's settlement time and fees
-        if (currentQuote && !currentQuote.error) {
-            if (currentQuote.confirmations_breakdown) {
-                const cb = currentQuote.confirmations_breakdown;
-                if (cb.confirmations === 0) {
-                    DOM.btcFinalityValue.textContent = 'Instant (0-conf)';
-                } else {
-                    const btcMin = Math.ceil(cb.asset_time / 60);
-                    DOM.btcFinalityValue.textContent = `~${btcMin} min (${cb.confirmations} conf)`;
+            // Update rate info with actual amount's settlement time and fees
+            if (currentQuote && !currentQuote.error) {
+                if (currentQuote.confirmations_breakdown) {
+                    const cb = currentQuote.confirmations_breakdown;
+                    if (cb.confirmations === 0) {
+                        DOM.btcFinalityValue.textContent = 'Instant (0-conf)';
+                    } else {
+                        const btcMin = Math.ceil(cb.asset_time / 60);
+                        DOM.btcFinalityValue.textContent = `~${btcMin} min (${cb.confirmations} conf)`;
+                    }
                 }
             }
+        } catch (e) {
+            console.error('[pna] Quote calculation error:', e);
+            DOM.outputAmount.textContent = '0.00';
         }
-
         updateButtonState();
     }, 300);
 }
@@ -1980,7 +2070,7 @@ async function loadSwapExplorer() {
         // Query all LPs and merge swap history
         const results = await Promise.allSettled(
             CONFIG.SDK_URLS.map(url =>
-                fetch(`${url}/api/swaps?limit=10`, { signal: AbortSignal.timeout(15000) })
+                fetch(`${url}/api/swaps?limit=4`, { signal: AbortSignal.timeout(CONFIG.LP_TIMEOUT_MS) })
                     .then(r => r.ok ? r.json() : { swaps: [] })
             )
         );
@@ -1995,7 +2085,7 @@ async function loadSwapExplorer() {
             if (seen.has(s.swap_id)) return false;
             seen.add(s.swap_id);
             return true;
-        }).sort((a, b) => (b.created_at || 0) - (a.created_at || 0)).slice(0, 10) };
+        }).sort((a, b) => (b.created_at || 0) - (a.created_at || 0)).slice(0, 4) };
 
         if (!data.swaps || data.swaps.length === 0) {
             container.innerHTML = '<div class="explorer-empty">No swaps yet. Be the first!</div>';
@@ -2184,7 +2274,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // Load LP endpoints from config file (fallback to hardcoded)
     try {
-        const resp = await fetch('lp-config.json');
+        const resp = await fetch('lp-config.json', { signal: AbortSignal.timeout(2000) });
         if (resp.ok) {
             const lpConfig = await resp.json();
             if (lpConfig.lp_endpoints && lpConfig.lp_endpoints.length > 0) {
@@ -2198,17 +2288,15 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // Show loading state
     DOM.rateValue.textContent = 'Loading...';
-
-    // Fetch LP info from SDK
-    await fetchLPInfo();
-
-    // Update display
     updateAssetDisplay();
-    await updateRateDisplay();
-    updateButtonState();
 
-    // Load swap explorer
-    await loadSwapExplorer();
+    // Run all startup fetches in parallel (no dependencies between them)
+    await Promise.allSettled([
+        fetchLPInfo(),
+        updateRateDisplay(),
+        loadSwapExplorer(),
+    ]);
+    updateButtonState();
 
     // Refresh rates periodically (pause during active swap)
     setInterval(async () => {
