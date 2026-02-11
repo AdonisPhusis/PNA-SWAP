@@ -1200,16 +1200,49 @@ function startPerLegPolling() {
                     break;
 
                 case 'completing':
-                    updateStepProgress(3);
-                    setStatusMessage('pending', 'Finalizing... USDC being sent to your wallet.');
-                    break;
-
                 case 'completed':
-                    updateStepProgress(4);
-                    setStatusMessage('success', 'Swap complete!');
-                    DOM.newSwapBtn.classList.remove('hidden');
-                    clearInterval(State.statusInterval);
-                    State.statusInterval = null;
+                    // Per-leg: LP_IN completes fast (just BTC claim).
+                    // For user-facing completion, poll LP_OUT (USDC delivery).
+                    if (swap._perleg_btc_claimed_notified && swap.lp_out_url && swap.swap_id_out) {
+                        try {
+                            const outResp = await fetch(`${swap.lp_out_url}/api/flowswap/${swap.swap_id_out}`);
+                            if (outResp.ok) {
+                                const outData = await outResp.json();
+                                console.log(`[pna] Per-leg LP_OUT state: ${outData.state}`);
+                                if (outData.state === 'completed') {
+                                    updateStepProgress(4);
+                                    setStatusMessage('success', 'Swap complete!');
+                                    if (outData.evm && outData.evm.claim_txhash) {
+                                        showTxLink('evm', outData.evm.claim_txhash);
+                                    }
+                                    DOM.newSwapBtn.classList.remove('hidden');
+                                    clearInterval(State.statusInterval);
+                                    State.statusInterval = null;
+                                } else if (outData.state === 'completing') {
+                                    updateStepProgress(3);
+                                    setStatusMessage('pending', 'Finalizing... USDC being sent to your wallet.');
+                                } else if (outData.state === 'failed') {
+                                    setStatusMessage('error', `LP_OUT failed: ${outData.error || 'Unknown error'}`);
+                                    DOM.newSwapBtn.classList.remove('hidden');
+                                    clearInterval(State.statusInterval);
+                                    State.statusInterval = null;
+                                }
+                                // lp_locked or btc_claimed: still waiting, keep polling
+                            }
+                        } catch (outErr) {
+                            console.warn('[pna] Per-leg LP_OUT poll error:', outErr);
+                        }
+                    } else if (inData.state === 'completed') {
+                        // Single-LP fallback or LP_OUT not yet notified
+                        updateStepProgress(4);
+                        setStatusMessage('success', 'Swap complete!');
+                        DOM.newSwapBtn.classList.remove('hidden');
+                        clearInterval(State.statusInterval);
+                        State.statusInterval = null;
+                    } else {
+                        updateStepProgress(3);
+                        setStatusMessage('pending', 'Finalizing... USDC being sent to your wallet.');
+                    }
                     break;
 
                 case 'failed':
@@ -1259,7 +1292,36 @@ async function autoPresignPerLeg() {
 
         const data = await response.json();
         console.log('[pna] Per-leg presign success:', data);
-        setStatusMessage('pending', 'BTC claimed. Waiting for USDC delivery...');
+
+        // Per-leg: relay BTC claim proof + revealed S_lp1 to LP_OUT
+        if (data.btc_claim_txid && data.S_lp1 && swap.swap_id_out && swap.lp_out_url) {
+            setStatusMessage('pending', 'BTC claimed. Notifying LP_OUT...');
+            try {
+                const outResp = await fetch(`${swap.lp_out_url}/api/flowswap/${swap.swap_id_out}/btc-claimed`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        btc_claim_txid: data.btc_claim_txid,
+                        S_user: State.S_user,
+                        S_lp1: data.S_lp1,
+                    }),
+                });
+                if (outResp.ok) {
+                    swap._perleg_btc_claimed_notified = true;
+                    console.log('[pna] Per-leg: LP_OUT notified of BTC claim');
+                    setStatusMessage('pending', 'LP_OUT completing... USDC being sent.');
+                } else {
+                    const err = await outResp.json();
+                    console.error('[pna] Per-leg btc-claimed notification failed:', err);
+                    setStatusMessage('error', `LP_OUT notification failed: ${err.detail || 'unknown'}`);
+                }
+            } catch (relayErr) {
+                console.error('[pna] Per-leg btc-claimed relay error:', relayErr);
+                setStatusMessage('error', 'Failed to notify LP_OUT: ' + relayErr.message);
+            }
+        } else {
+            setStatusMessage('pending', 'BTC claimed. Waiting for USDC delivery...');
+        }
     } catch (e) {
         console.error('[pna] Per-leg presign error:', e);
         setStatusMessage('error', 'Presign failed: ' + e.message);
