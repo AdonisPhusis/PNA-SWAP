@@ -57,7 +57,7 @@ const CONFIG = {
     // LP endpoints - multi-LP: queries all, picks best rate
     SDK_URLS: [
         'http://57.131.33.152:8080',  // LP1 (OP1)
-        // 'http://57.131.33.214:8080',  // LP2 (OP2) - disabled for now
+        'http://57.131.33.214:8080',  // LP2 (OP2)
     ],
     STATUS_REFRESH_MS: 5000,
     QUOTE_REFRESH_MS: 10000,
@@ -562,8 +562,21 @@ async function fetchQuote(fromAsset, toAsset, amount) {
             return null;
         }
 
-        // Pick best rate (highest toAmount for user)
-        const best = quotes.reduce((a, b) =>
+        // Liquidity-first: filter LPs that can actually fill the order
+        const fillable = quotes.filter(q => q.inventory_ok !== false);
+
+        if (fillable.length === 0) {
+            // No LP has enough liquidity — find best max_amount for feedback
+            const bestMax = quotes.reduce((a, b) =>
+                parseFloat(b.max_amount || 0) > parseFloat(a.max_amount || 0) ? b : a
+            );
+            currentQuote = { error: 'max', maxAmount: bestMax.max_amount, asset: fromAsset };
+            console.warn(`[pna] No LP has enough liquidity. Best max: ${bestMax.max_amount} ${fromAsset}`);
+            return null;
+        }
+
+        // Among fillable LPs, pick best rate (highest toAmount for user)
+        const best = fillable.reduce((a, b) =>
             parseFloat(b.toAmount || b.to_amount || 0) > parseFloat(a.toAmount || a.to_amount || 0) ? b : a
         );
 
