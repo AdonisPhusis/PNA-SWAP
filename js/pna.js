@@ -963,15 +963,13 @@ function updateButtonState() {
 async function initiateSwap() {
     if (DOM.swapBtn.disabled) return;
 
-    // Per-leg route: fallback to full-route LP for execution (Phase 4 will add init-leg)
-    if (State.routeType === 'perleg') {
-        const fullQuote = await fetchQuote(State.fromAsset, State.toAsset, State.inputAmount);
-        if (fullQuote) {
-            console.log('[pna] Per-leg display, but using full-route LP for execution (Phase 4 pending)');
-        } else {
-            setStatusMessage('error', 'Per-leg swap execution not yet available. No full-route LP found.');
-            return;
+    // Per-leg route: use multi-LP init (BTC→M1 on LP_IN, M1→USDC on LP_OUT)
+    if (State.routeType === 'perleg' && State.routeLegs) {
+        if (State.fromAsset === 'BTC' && State.toAsset === 'USDC') {
+            return await initiatePerLegSwap();
         }
+        // Reverse per-leg not yet supported — fall through to single-LP
+        console.log('[pna] Per-leg reverse not supported yet, falling back to single LP');
     }
 
     if (State.fromAsset === 'BTC' && State.toAsset === 'USDC') {
@@ -980,6 +978,291 @@ async function initiateSwap() {
         return await initiateSwapUsdcToBtc();
     } else {
         setStatusMessage('error', 'Only BTC <-> USDC supported');
+    }
+}
+
+// ---- PER-LEG: BTC -> M1 (LP_IN) + M1 -> USDC (LP_OUT) ----
+
+async function initiatePerLegSwap() {
+    const btn = DOM.swapBtn;
+    const btnText = btn.querySelector('.btn-text');
+
+    try {
+        btn.classList.add('loading');
+        btnText.textContent = 'Initializing multi-LP swap...';
+        btn.disabled = true;
+
+        const S_user = generateSecret();
+        const H_user = await sha256hex(S_user);
+        State.S_user = S_user;
+        console.log('[pna] Per-leg swap: H_user:', H_user.slice(0, 16) + '...');
+
+        const leg1 = State.routeLegs.leg1;  // BTC→M1 (LP_IN)
+        const leg2 = State.routeLegs.leg2;  // M1→USDC (LP_OUT)
+
+        // Step 1: Init LP_OUT (M1→USDC) — get H_lp2 + lp_m1_address
+        console.log('[pna] Per-leg step 1: init LP_OUT at', leg2._url);
+        const outResp = await fetch(`${leg2._url}/api/flowswap/init-leg`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                leg: 'M1/USDC',
+                from_asset: 'M1',
+                to_asset: 'USDC',
+                amount: leg2.from_amount || leg1.to_amount,
+                H_user: H_user,
+                user_usdc_address: State.destAddress,
+            }),
+        });
+        if (!outResp.ok) {
+            const err = await outResp.json();
+            throw new Error(`LP_OUT init failed: ${err.detail || outResp.status}`);
+        }
+        const outData = await outResp.json();
+        console.log('[pna] LP_OUT init-leg:', outData);
+
+        // Step 2: Init LP_IN (BTC→M1) — with LP_OUT's H_lp2 + M1 address
+        console.log('[pna] Per-leg step 2: init LP_IN at', leg1._url);
+        const inResp = await fetch(`${leg1._url}/api/flowswap/init-leg`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                leg: 'BTC/M1',
+                from_asset: 'BTC',
+                to_asset: 'M1',
+                amount: State.inputAmount,
+                H_user: H_user,
+                H_lp_other: outData.H_lp2,
+                lp_out_m1_address: outData.lp_m1_address,
+            }),
+        });
+        if (!inResp.ok) {
+            const err = await inResp.json();
+            throw new Error(`LP_IN init failed: ${err.detail || inResp.status}`);
+        }
+        const inData = await inResp.json();
+        console.log('[pna] LP_IN init-leg:', inData);
+
+        // Step 3: Store multi-LP swap state
+        State.currentSwap = {
+            swap_id: inData.swap_id,
+            swap_id_out: outData.swap_id,
+            is_perleg: true,
+            lp_in_url: leg1._url,
+            lp_out_url: leg2._url,
+            lp_in_name: leg1.lp_name,
+            lp_out_name: leg2.lp_name,
+            state: inData.state,
+            direction: 'forward',
+            from_asset: 'BTC',
+            to_asset: 'USDC',
+            from_amount: State.inputAmount,
+            to_amount: State.outputAmount,
+            dest_address: State.destAddress,
+            btc_deposit_address: inData.btc_deposit.address,
+            btc_amount_sats: inData.btc_deposit.amount_sats,
+            btc_amount_btc: inData.btc_deposit.amount_btc,
+            instant_min_feerate: inData.btc_deposit.instant_min_feerate || 4,
+            usdc_amount: outData.usdc_output ? outData.usdc_output.amount : State.outputAmount,
+            evm_htlc_id: null,
+            H_user: H_user,
+            H_lp1: inData.H_lp1,
+            H_lp2: outData.H_lp2,
+            plan_expires_at: Math.min(inData.plan_expires_at || 0, outData.plan_expires_at || 0),
+            // Per-leg coordination state
+            _perleg_m1_notified: false,
+            _perleg_secret_delivered: false,
+        };
+
+        showFlowSwapStatus(State.currentSwap);
+        startPerLegPolling();
+
+    } catch (error) {
+        console.error('[pna] Per-leg swap init error:', error);
+        setStatusMessage('error', 'Multi-LP swap failed: ' + error.message);
+        btn.classList.remove('loading');
+        btnText.textContent = `Swap BTC \u2192 USDC`;
+        btn.disabled = false;
+    }
+}
+
+function startPerLegPolling() {
+    if (State.statusInterval) {
+        clearInterval(State.statusInterval);
+    }
+
+    State.statusInterval = setInterval(async () => {
+        if (!State.currentSwap || !State.currentSwap.is_perleg) return;
+
+        const swap = State.currentSwap;
+
+        try {
+            // Poll LP_IN status
+            const inResp = await fetch(`${swap.lp_in_url}/api/flowswap/${swap.swap_id}`);
+            if (!inResp.ok) return;
+            const inData = await inResp.json();
+
+            const prevState = swap.state;
+            swap.state = inData.state;
+
+            // Allow btc_funded to re-process (stability countdown)
+            if (prevState === inData.state && inData.state !== 'btc_funded') return;
+            console.log(`[pna] Per-leg LP_IN state: ${prevState} -> ${inData.state}`);
+
+            switch (inData.state) {
+                case 'awaiting_btc':
+                    updateStepProgress(1);
+                    setStatusMessage('pending', 'Waiting for BTC deposit...');
+                    break;
+
+                case 'btc_funded':
+                    updateStepProgress(2);
+                    DOM.btcSentBtn.classList.add('hidden');
+                    DOM.depositBox.classList.add('hidden');
+                    if (inData.stability_check_until) {
+                        const remaining = inData.stability_check_until - Math.floor(Date.now() / 1000);
+                        if (remaining > 0) {
+                            setStatusMessage('pending', `Verifying deposit... ${remaining}s`);
+                        } else {
+                            setStatusMessage('pending', 'Deposit verified. LP_IN locking M1...');
+                        }
+                    } else {
+                        setStatusMessage('pending', `BTC detected. ${swap.lp_in_name || 'LP_IN'} locking M1...`);
+                    }
+                    break;
+
+                case 'm1_locked':
+                    // LP_IN locked M1 → notify LP_OUT
+                    updateStepProgress(2);
+                    if (!swap._perleg_m1_notified) {
+                        setStatusMessage('pending', `M1 locked by ${swap.lp_in_name || 'LP_IN'}. Notifying ${swap.lp_out_name || 'LP_OUT'}...`);
+                        swap._perleg_m1_notified = true;
+
+                        const m1_outpoint = inData.m1 ? inData.m1.htlc_outpoint : (inData.m1_htlc_outpoint || '');
+                        console.log('[pna] Per-leg: notifying LP_OUT m1-locked, outpoint=', m1_outpoint);
+
+                        try {
+                            const m1Resp = await fetch(`${swap.lp_out_url}/api/flowswap/${swap.swap_id_out}/m1-locked`, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({
+                                    m1_htlc_outpoint: m1_outpoint,
+                                    H_lp1: swap.H_lp1,
+                                }),
+                            });
+                            if (!m1Resp.ok) {
+                                const err = await m1Resp.json();
+                                console.error('[pna] m1-locked notification failed:', err);
+                                setStatusMessage('error', `LP_OUT USDC lock failed: ${err.detail || 'unknown error'}`);
+                                return;
+                            }
+                            const m1Data = await m1Resp.json();
+                            console.log('[pna] LP_OUT locked USDC, got S_lp2');
+
+                            // Deliver S_lp2 to LP_IN
+                            setStatusMessage('pending', `USDC locked by ${swap.lp_out_name || 'LP_OUT'}. Delivering secret...`);
+                            const delResp = await fetch(`${swap.lp_in_url}/api/flowswap/${swap.swap_id}/deliver-secret`, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ S_lp2: m1Data.S_lp2 }),
+                            });
+                            if (!delResp.ok) {
+                                const err = await delResp.json();
+                                console.error('[pna] deliver-secret failed:', err);
+                                setStatusMessage('error', `Secret delivery failed: ${err.detail || 'unknown error'}`);
+                                return;
+                            }
+                            swap._perleg_secret_delivered = true;
+                            swap.evm_htlc_id = m1Data.evm_htlc_id;
+                            console.log('[pna] Per-leg: secret delivered, LP_IN ready for presign');
+                            // Next poll will see lp_locked and autoPresign
+                        } catch (e) {
+                            console.error('[pna] Per-leg coordination error:', e);
+                            setStatusMessage('error', 'Multi-LP coordination failed: ' + e.message);
+                        }
+                    }
+                    break;
+
+                case 'lp_locked':
+                    updateStepProgress(2);
+                    setStatusMessage('pending', 'Both LPs locked. Completing swap...');
+                    DOM.btcSentBtn.classList.add('hidden');
+                    DOM.depositBox.classList.add('hidden');
+                    autoPresignPerLeg();
+                    break;
+
+                case 'btc_claimed':
+                    updateStepProgress(3);
+                    setStatusMessage('pending', 'BTC claimed by LP. Waiting for USDC delivery...');
+                    if (inData.btc && inData.btc.claim_txid) {
+                        showTxLink('btc', inData.btc.claim_txid);
+                    }
+                    break;
+
+                case 'completing':
+                    updateStepProgress(3);
+                    setStatusMessage('pending', 'Finalizing... USDC being sent to your wallet.');
+                    break;
+
+                case 'completed':
+                    updateStepProgress(4);
+                    setStatusMessage('success', 'Swap complete!');
+                    DOM.newSwapBtn.classList.remove('hidden');
+                    clearInterval(State.statusInterval);
+                    State.statusInterval = null;
+                    break;
+
+                case 'failed':
+                    setStatusMessage('error', `Swap failed: ${inData.error || 'Unknown error'}`);
+                    DOM.newSwapBtn.classList.remove('hidden');
+                    clearInterval(State.statusInterval);
+                    State.statusInterval = null;
+                    break;
+
+                case 'expired':
+                    setStatusMessage('error', 'Plan expired. No funds were locked.');
+                    DOM.newSwapBtn.classList.remove('hidden');
+                    DOM.btcSentBtn.classList.add('hidden');
+                    DOM.depositBox.classList.add('hidden');
+                    clearInterval(State.statusInterval);
+                    State.statusInterval = null;
+                    break;
+            }
+        } catch (e) {
+            console.warn('[pna] Per-leg poll error:', e);
+        }
+    }, CONFIG.STATUS_REFRESH_MS);
+}
+
+async function autoPresignPerLeg() {
+    if (!State.currentSwap || !State.S_user || !State.currentSwap.is_perleg) return;
+
+    const swap = State.currentSwap;
+    console.log('[pna] Per-leg: sending S_user to LP_IN...');
+
+    updateStepProgress(3);
+    setStatusMessage('pending', 'Completing settlement...');
+
+    try {
+        const response = await fetch(`${swap.lp_in_url}/api/flowswap/${swap.swap_id}/presign`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ S_user: State.S_user }),
+        });
+
+        if (!response.ok) {
+            const err = await response.json();
+            console.error('[pna] Per-leg presign failed:', err);
+            setStatusMessage('error', `Presign failed: ${err.detail || 'unknown'}`);
+            return;
+        }
+
+        const data = await response.json();
+        console.log('[pna] Per-leg presign success:', data);
+        setStatusMessage('pending', 'BTC claimed. Waiting for USDC delivery...');
+    } catch (e) {
+        console.error('[pna] Per-leg presign error:', e);
+        setStatusMessage('error', 'Presign failed: ' + e.message);
     }
 }
 
