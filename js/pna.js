@@ -129,6 +129,8 @@ const State = {
     statusInterval: null,
     modalTarget: null,   // 'from' or 'to'
     activeLpUrl: null,   // Selected LP URL for current swap
+    routeType: null,     // 'full' or 'perleg'
+    routeLegs: null,     // { leg1: {..., _url}, leg2: {..., _url} } when perleg
 };
 
 /**
@@ -595,6 +597,166 @@ async function fetchQuote(fromAsset, toAsset, amount) {
     }
 }
 
+// =============================================================================
+// PER-LEG ROUTING (Blueprint 16 — Multi-LP)
+// =============================================================================
+
+/**
+ * Query all LPs for a single leg (X→M1 or M1→Y).
+ */
+async function fetchLegQuotes(fromAsset, toAsset, amount) {
+    if (amount <= 0) return [];
+    const results = await Promise.allSettled(
+        CONFIG.SDK_URLS.map(url =>
+            fetch(`${url}/api/quote/leg?from=${fromAsset}&to=${toAsset}&amount=${amount}`,
+                { signal: AbortSignal.timeout(15000) })
+                .then(async r => {
+                    if (!r.ok) return null;
+                    const data = await r.json();
+                    return { ...data, _url: url };
+                })
+        )
+    );
+    return results
+        .filter(r => r.status === 'fulfilled' && r.value)
+        .map(r => r.value);
+}
+
+/**
+ * Liquidity-first, then best price — for a single leg.
+ */
+function selectBestLeg(quotes) {
+    if (!quotes || quotes.length === 0) return null;
+    const fillable = quotes.filter(q => q.inventory_ok !== false);
+    if (fillable.length === 0) return null;
+    return fillable.reduce((a, b) =>
+        parseFloat(b.to_amount || 0) > parseFloat(a.to_amount || 0) ? b : a
+    );
+}
+
+/**
+ * Compose a per-leg route: query leg 1 (from→M1), then leg 2 (M1→to).
+ */
+async function fetchPerLegRoute(fromAsset, toAsset, amount) {
+    // Only for cross-chain (both sides != M1)
+    if (fromAsset === 'M1' || toAsset === 'M1') return null;
+
+    try {
+        // Leg 1: from → M1
+        const leg1Quotes = await fetchLegQuotes(fromAsset, 'M1', amount);
+        const bestLeg1 = selectBestLeg(leg1Quotes);
+        if (!bestLeg1) return null;
+
+        // Leg 2: M1 → to (use leg 1 output as input)
+        const leg2Quotes = await fetchLegQuotes('M1', toAsset, bestLeg1.to_amount);
+        const bestLeg2 = selectBestLeg(leg2Quotes);
+        if (!bestLeg2) return null;
+
+        return {
+            type: 'perleg',
+            leg1: bestLeg1,
+            leg2: bestLeg2,
+            total_output: bestLeg2.to_amount,
+            total_spread: bestLeg1.spread_percent + bestLeg2.spread_percent,
+            route: `${fromAsset} \u2192 M1 (${bestLeg1.lp_name}) \u2192 ${toAsset} (${bestLeg2.lp_name})`,
+            settlement_time_seconds: bestLeg1.settlement_time_seconds + bestLeg2.settlement_time_seconds,
+            settlement_time_human: `~${Math.ceil(
+                (bestLeg1.settlement_time_seconds + bestLeg2.settlement_time_seconds) / 60
+            )} min`,
+            confirmations_required: bestLeg1.confirmations_required,
+            confirmations_breakdown: bestLeg1.confirmations_breakdown,
+        };
+    } catch (e) {
+        console.warn('[pna] Per-leg route error:', e);
+        return null;
+    }
+}
+
+/**
+ * Compare full-route (single LP) vs per-leg (multi-LP). Pick best output.
+ */
+async function fetchBestRoute(fromAsset, toAsset, amount) {
+    if (amount <= 0) return null;
+
+    // M1 direct legs — skip per-leg composition
+    if (fromAsset === 'M1' || toAsset === 'M1') {
+        const quote = await fetchQuote(fromAsset, toAsset, amount);
+        if (quote) {
+            State.routeType = 'full';
+            State.routeLegs = null;
+        }
+        return quote;
+    }
+
+    // Query both in parallel
+    const [fullResult, perLegResult] = await Promise.allSettled([
+        fetchQuote(fromAsset, toAsset, amount),
+        fetchPerLegRoute(fromAsset, toAsset, amount),
+    ]);
+
+    const fullRoute = fullResult.status === 'fulfilled' ? fullResult.value : null;
+    const perLeg = perLegResult.status === 'fulfilled' ? perLegResult.value : null;
+
+    if (!fullRoute && !perLeg) return null;
+
+    // Only full-route available
+    if (!perLeg) {
+        State.routeType = 'full';
+        State.routeLegs = null;
+        return fullRoute;
+    }
+
+    // Build a currentQuote-compatible object from per-leg
+    function buildPerLegQuote(pl) {
+        return {
+            lp_id: `${pl.leg1.lp_id}+${pl.leg2.lp_id}`,
+            lp_name: `${pl.leg1.lp_name} + ${pl.leg2.lp_name}`,
+            from_asset: fromAsset,
+            to_asset: toAsset,
+            from_amount: amount,
+            to_amount: pl.total_output,
+            rate: pl.total_output / amount,
+            route: pl.route,
+            spread_percent: pl.total_spread,
+            settlement_time_seconds: pl.settlement_time_seconds,
+            settlement_time_human: pl.settlement_time_human,
+            confirmations_required: pl.confirmations_required,
+            confirmations_breakdown: pl.confirmations_breakdown,
+            inventory_ok: true,
+            min_amount: pl.leg1.min_amount,
+            max_amount: pl.leg1.max_amount,
+        };
+    }
+
+    // Only per-leg available
+    if (!fullRoute) {
+        State.routeType = 'perleg';
+        State.routeLegs = { leg1: perLeg.leg1, leg2: perLeg.leg2 };
+        State.activeLpUrl = null;
+        currentQuote = buildPerLegQuote(perLeg);
+        return currentQuote;
+    }
+
+    // Both available — compare to_amount
+    const fullOutput = parseFloat(fullRoute.to_amount || 0);
+    const perLegOutput = parseFloat(perLeg.total_output || 0);
+
+    if (perLegOutput > fullOutput) {
+        State.routeType = 'perleg';
+        State.routeLegs = { leg1: perLeg.leg1, leg2: perLeg.leg2 };
+        State.activeLpUrl = null;
+        currentQuote = buildPerLegQuote(perLeg);
+        console.log(`[pna] Per-leg route wins: ${perLegOutput} > ${fullOutput} (full)`);
+        return currentQuote;
+    }
+
+    // Full-route wins (or tie)
+    State.routeType = 'full';
+    State.routeLegs = null;
+    console.log(`[pna] Full-route wins: ${fullOutput} >= ${perLegOutput} (per-leg)`);
+    return fullRoute;
+}
+
 function updateLPDisplay() {
     // Update LP name in header if element exists
     const lpNameEl = document.getElementById('lp-name');
@@ -638,7 +800,7 @@ function getSettlementTime(fromAsset, toAsset) {
 async function updateRateDisplay() {
     // Use a small reference amount for rate display (avoids inflated settlement time)
     const refAmount = State.fromAsset === 'BTC' ? 0.001 : (State.fromAsset === 'USDC' ? 50 : 1);
-    const quote = await fetchQuote(State.fromAsset, State.toAsset, refAmount);
+    const quote = await fetchBestRoute(State.fromAsset, State.toAsset, refAmount);
 
     if (quote) {
         // Format rate display
@@ -684,8 +846,8 @@ async function updateRateDisplay() {
 async function calculateOutput(inputAmount) {
     if (inputAmount <= 0) return 0;
 
-    // Fetch real quote from SDK
-    const quote = await fetchQuote(State.fromAsset, State.toAsset, inputAmount);
+    // Fetch best route (full-route vs per-leg)
+    const quote = await fetchBestRoute(State.fromAsset, State.toAsset, inputAmount);
 
     if (quote) {
         return quote.to_amount;
@@ -800,6 +962,17 @@ function updateButtonState() {
 
 async function initiateSwap() {
     if (DOM.swapBtn.disabled) return;
+
+    // Per-leg route: fallback to full-route LP for execution (Phase 4 will add init-leg)
+    if (State.routeType === 'perleg') {
+        const fullQuote = await fetchQuote(State.fromAsset, State.toAsset, State.inputAmount);
+        if (fullQuote) {
+            console.log('[pna] Per-leg display, but using full-route LP for execution (Phase 4 pending)');
+        } else {
+            setStatusMessage('error', 'Per-leg swap execution not yet available. No full-route LP found.');
+            return;
+        }
+    }
 
     if (State.fromAsset === 'BTC' && State.toAsset === 'USDC') {
         return await initiateSwapBtcToUsdc();
