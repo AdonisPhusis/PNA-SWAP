@@ -54,10 +54,11 @@ const MOCK_RATES = {
 // =============================================================================
 
 const CONFIG = {
-    // LP endpoints - multi-LP: queries all, picks best rate
+    // LP endpoints - loaded dynamically from lp-config.json at startup.
+    // Fallback to hardcoded values if config file unavailable.
     SDK_URLS: [
-        'http://57.131.33.152:8080',  // LP1 (OP1)
-        'http://57.131.33.214:8080',  // LP2 (OP2)
+        'http://57.131.33.152:8080',  // LP1 (OP1) — fallback
+        'http://57.131.33.214:8080',  // LP2 (OP2) — fallback
     ],
     STATUS_REFRESH_MS: 5000,
     QUOTE_REFRESH_MS: 10000,
@@ -2180,6 +2181,20 @@ window.copyDepositAddress = copyDepositAddress;
 
 document.addEventListener('DOMContentLoaded', async () => {
     console.log('[pna] Initializing FlowSwap 3S...');
+
+    // Load LP endpoints from config file (fallback to hardcoded)
+    try {
+        const resp = await fetch('lp-config.json');
+        if (resp.ok) {
+            const lpConfig = await resp.json();
+            if (lpConfig.lp_endpoints && lpConfig.lp_endpoints.length > 0) {
+                CONFIG.SDK_URLS = lpConfig.lp_endpoints.map(lp => lp.url);
+                console.log('[pna] LP endpoints loaded from config:', CONFIG.SDK_URLS);
+            }
+        }
+    } catch (e) {
+        console.warn('[pna] Could not load lp-config.json, using defaults:', e.message);
+    }
 
     // Show loading state
     DOM.rateValue.textContent = 'Loading...';
