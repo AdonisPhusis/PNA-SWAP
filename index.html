@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>P&A - Trustless Cross-Chain Settlement</title>
     <link rel="icon" href="img/pna-logo.jpg">
-    <link rel="stylesheet" href="css/style.css?v=22">
+    <link rel="stylesheet" href="css/style.css?v=25">
 </head>
 <body>
     <div class="container">
@@ -60,6 +60,18 @@
                 </div>
             </div>
 
+            <!-- LP Provider Info -->
+            <div class="lp-provider-row">
+                <div class="lp-provider-left">
+                    <span id="lp-tier-badge" class="tier-badge" style="display:none">MN Verified</span>
+                    <span id="lp-count" class="lp-count"></span>
+                </div>
+                <label class="show-all-toggle">
+                    <input type="checkbox" id="show-all-lps" onchange="toggleShowAllLPs()">
+                    <span class="toggle-label">Show all providers</span>
+                </label>
+            </div>
+
             <!-- Rate Info -->
             <div class="rate-info">
                 <div class="rate-row">
@@ -77,6 +89,30 @@
                 <div class="rate-row">
                     <span class="rate-label">BTC finality</span>
                     <span id="btc-finality-value" class="rate-value time">-</span>
+                </div>
+            </div>
+
+            <!-- Quote Breakdown (visible when amount entered) -->
+            <div class="quote-breakdown" id="quote-breakdown" style="display: none;">
+                <div class="breakdown-row">
+                    <span>You send</span>
+                    <span id="bd-send" class="bd-value">-</span>
+                </div>
+                <div class="breakdown-row">
+                    <span>You receive</span>
+                    <span id="bd-receive" class="bd-value bd-highlight">-</span>
+                </div>
+                <div class="breakdown-row bd-detail">
+                    <span>Market rate</span>
+                    <span id="bd-rate-market" class="bd-value">-</span>
+                </div>
+                <div class="breakdown-row bd-detail">
+                    <span>LP spread</span>
+                    <span id="bd-spread" class="bd-value">-</span>
+                </div>
+                <div class="breakdown-row bd-detail">
+                    <span>Effective rate</span>
+                    <span id="bd-rate-effective" class="bd-value">-</span>
                 </div>
             </div>
 
@@ -260,6 +296,6 @@
     </div>
 
     <script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.13.4/ethers.umd.min.js" crossorigin="anonymous"></script>
-    <script src="js/pna.js?v=22"></script>
+    <script src="js/pna.js?v=25"></script>
 </body>
 </html>

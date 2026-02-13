@@ -91,12 +91,13 @@ const MOCK_RATES = {
 // =============================================================================
 
 const CONFIG = {
-    // LP endpoints - loaded dynamically from lp-config.json at startup.
-    // Fallback to hardcoded values if config file unavailable.
-    SDK_URLS: [
-        'http://57.131.33.152:8080',  // LP1 (OP1) — fallback
-        'http://57.131.33.214:8080',  // LP2 (OP2) — fallback
-    ],
+    // LP endpoints - loaded dynamically from registry or lp-config.json at startup.
+    SDK_URLS: [],
+    // PNA LP Registry (permissionless on-chain discovery)
+    REGISTRY_URL: 'http://162.19.251.75:3003',
+    REGISTRY_TIMEOUT_MS: 3000,
+    LP_REGISTRY: [],         // Populated from registry: [{endpoint, tier, address, ...}]
+    SHOW_ALL_LPS: false,     // false = Tier 1 only by default
     STATUS_REFRESH_MS: 5000,
     QUOTE_REFRESH_MS: 10000,
     LP_TIMEOUT_MS: 4000,
@@ -461,27 +462,29 @@ async function swapDirection() {
 
     // Keep the same INPUT value (now it's the other asset)
     State.inputAmount = previousInput;
-    DOM.outputAmount.textContent = '...';
 
     // Update display (asset labels)
     updateAssetDisplay();
 
     // Recalculate output with new direction
     if (State.inputAmount > 0) {
-        // Force immediate recalculation (skip debounce)
+        DOM.outputAmount.textContent = '...';
         const newOutput = await calculateOutput(State.inputAmount);
         State.outputAmount = newOutput;
 
-        // Check for errors (min/max)
         if (currentQuote && currentQuote.error === 'min') {
             DOM.outputAmount.textContent = `Min: ${formatNumber(currentQuote.minAmount, 2)} ${currentQuote.asset}`;
+            updateQuoteBreakdown(null);
         } else if (currentQuote && currentQuote.error === 'max') {
             DOM.outputAmount.textContent = `Max: ${formatNumber(currentQuote.maxAmount, 2)} ${currentQuote.asset}`;
+            updateQuoteBreakdown(null);
         } else {
-            const toAsset = ASSETS[State.toAsset];
-            const displayDecimals = State.outputAmount >= 1000 ? 2 : (toAsset.decimals > 4 ? 4 : toAsset.decimals);
-            DOM.outputAmount.textContent = formatNumber(State.outputAmount, displayDecimals);
+            updateOutputDisplay();
+            updateQuoteBreakdown(currentQuote);
         }
+    } else {
+        DOM.outputAmount.textContent = '0.00';
+        updateQuoteBreakdown(null);
     }
 
     await updateRateDisplay();
@@ -768,6 +771,9 @@ async function fetchBestRoute(fromAsset, toAsset, amount) {
 
     // Build a currentQuote-compatible object from per-leg
     function buildPerLegQuote(pl) {
+        const effectiveRate = pl.total_output / amount;
+        const spreadFrac = (pl.total_spread || 0) / 100;
+        const marketRate = spreadFrac < 1 ? effectiveRate / (1 - spreadFrac) : effectiveRate;
         return {
             lp_id: `${pl.leg1.lp_id}+${pl.leg2.lp_id}`,
             lp_name: `${pl.leg1.lp_name} + ${pl.leg2.lp_name}`,
@@ -775,9 +781,10 @@ async function fetchBestRoute(fromAsset, toAsset, amount) {
             to_asset: toAsset,
             from_amount: amount,
             to_amount: pl.total_output,
-            rate: pl.total_output / amount,
+            rate: effectiveRate,
+            rate_market: marketRate,
             route: pl.route,
-            spread_percent: pl.total_spread,
+            spread_percent: pl.total_spread || 0,
             settlement_time_seconds: pl.settlement_time_seconds,
             settlement_time_human: pl.settlement_time_human,
             confirmations_required: pl.confirmations_required,
@@ -822,6 +829,59 @@ function updateLPDisplay() {
     const lpNameEl = document.getElementById('lp-name');
     if (lpNameEl) {
         lpNameEl.textContent = currentLP.name;
+    }
+}
+
+function updateTierDisplay() {
+    // Show tier badge for the active LP
+    const badge = document.getElementById('lp-tier-badge');
+    if (!badge) return;
+
+    if (CONFIG.LP_REGISTRY.length === 0) {
+        badge.style.display = 'none';
+        return;
+    }
+
+    // Find the active LP in registry
+    const activeLp = CONFIG.LP_REGISTRY.find(
+        lp => lp.endpoint === (State.activeLpUrl || CONFIG.SDK_URLS[0])
+    );
+    if (activeLp && activeLp.tier === 1) {
+        badge.textContent = 'MN Verified';
+        badge.className = 'tier-badge tier-1';
+        badge.style.display = 'inline-block';
+    } else if (activeLp) {
+        badge.textContent = 'Community LP';
+        badge.className = 'tier-badge tier-2';
+        badge.style.display = 'inline-block';
+    } else {
+        badge.style.display = 'none';
+    }
+
+    // Update LP count display
+    const countEl = document.getElementById('lp-count');
+    if (countEl) {
+        const tier1 = CONFIG.LP_REGISTRY.filter(lp => lp.tier === 1).length;
+        const total = CONFIG.LP_REGISTRY.length;
+        countEl.textContent = `${total} LP${total > 1 ? 's' : ''} (${tier1} verified)`;
+    }
+}
+
+function toggleShowAllLPs() {
+    const checkbox = document.getElementById('show-all-lps');
+    if (!checkbox) return;
+    CONFIG.SHOW_ALL_LPS = checkbox.checked;
+
+    if (CONFIG.LP_REGISTRY.length > 0) {
+        CONFIG.SDK_URLS = CONFIG.LP_REGISTRY
+            .filter(lp => CONFIG.SHOW_ALL_LPS || lp.tier === 1)
+            .map(lp => lp.endpoint);
+        if (CONFIG.SDK_URLS.length === 0) {
+            CONFIG.SDK_URLS = CONFIG.LP_REGISTRY.map(lp => lp.endpoint);
+        }
+        console.log(`[pna] Show all: ${CONFIG.SHOW_ALL_LPS}, active LPs: ${CONFIG.SDK_URLS.length}`);
+        fetchLPInfo();
+        updateTierDisplay();
     }
 }
 
@@ -949,64 +1009,138 @@ async function calculateOutput(inputAmount) {
 }
 
 // =============================================================================
+// QUOTE BREAKDOWN
+// =============================================================================
+
+function formatAmountWithSats(amount, asset) {
+    if (asset === 'BTC') {
+        const sats = Math.round(amount * 1e8);
+        return `${amount.toFixed(8)} BTC (${sats.toLocaleString()} sats)`;
+    }
+    if (asset === 'M1') {
+        const sats = Math.round(amount * 1e8);
+        return `${sats.toLocaleString()} M1`;
+    }
+    if (asset === 'USDC') {
+        return `${amount.toFixed(2)} USDC`;
+    }
+    return `${amount.toFixed(ASSETS[asset]?.decimals || 8)} ${asset}`;
+}
+
+function formatRateDisplay(rate, fromAsset, toAsset) {
+    if (rate == null || isNaN(rate)) return '-';
+    if (rate >= 1000) return `1 ${fromAsset} = ${formatNumber(rate, 2)} ${toAsset}`;
+    if (rate >= 1) return `1 ${fromAsset} = ${rate.toFixed(4)} ${toAsset}`;
+    return `1 ${fromAsset} = ${rate.toFixed(8)} ${toAsset}`;
+}
+
+function updateQuoteBreakdown(quote) {
+    const el = document.getElementById('quote-breakdown');
+    if (!quote || !quote.from_amount || quote.error) {
+        el.style.display = 'none';
+        return;
+    }
+
+    document.getElementById('bd-send').textContent =
+        formatAmountWithSats(quote.from_amount, State.fromAsset);
+    document.getElementById('bd-receive').textContent =
+        formatAmountWithSats(quote.to_amount, State.toAsset);
+    document.getElementById('bd-rate-market').textContent =
+        formatRateDisplay(quote.rate_market, State.fromAsset, State.toAsset);
+    document.getElementById('bd-spread').textContent =
+        quote.spread_percent > 0 ? `${quote.spread_percent.toFixed(2)}%` : 'None';
+    document.getElementById('bd-rate-effective').textContent =
+        formatRateDisplay(quote.rate, State.fromAsset, State.toAsset);
+
+    el.style.display = '';
+}
+
+// =============================================================================
 // INPUT HANDLING
 // =============================================================================
 
 // Debounce timer for input changes
 let inputDebounceTimer = null;
 
-async function onInputChange() {
+function updateOutputDisplay() {
+    if (State.toAsset === 'BTC') {
+        DOM.outputAmount.textContent = State.outputAmount.toFixed(8);
+    } else if (State.toAsset === 'USDC') {
+        DOM.outputAmount.textContent = formatNumber(State.outputAmount, 2);
+    } else if (State.toAsset === 'M1') {
+        const sats = Math.round(State.outputAmount * 1e8);
+        DOM.outputAmount.textContent = sats.toLocaleString();
+    } else {
+        DOM.outputAmount.textContent = formatNumber(State.outputAmount, ASSETS[State.toAsset]?.decimals || 4);
+    }
+}
+
+// silent=true: periodic refresh (no loading flash, keep current values until new data)
+// silent=false: user typing (show '...' loading indicator)
+async function onInputChange(silent = false) {
     const value = parseFloat(DOM.inputAmount.value) || 0;
     State.inputAmount = value;
 
-    // Show loading state
-    DOM.outputAmount.textContent = '...';
-
-    // Debounce API calls (wait 300ms after user stops typing)
+    // Always cancel pending debounce (prevents stale timer firing after clear)
     if (inputDebounceTimer) {
         clearTimeout(inputDebounceTimer);
+        inputDebounceTimer = null;
     }
 
+    if (value <= 0) {
+        DOM.outputAmount.textContent = '0.00';
+        updateQuoteBreakdown(null);
+        updateButtonState();
+        return;
+    }
+
+    // Only show loading flash on user-initiated input
+    if (!silent) {
+        DOM.outputAmount.textContent = '...';
+    }
+
+    const delay = silent ? 0 : 300;
     inputDebounceTimer = setTimeout(async () => {
         try {
-            // Fetch real quote from SDK
             State.outputAmount = await calculateOutput(value);
 
             // Check for errors (min/max)
             if (currentQuote && currentQuote.error === 'min') {
                 DOM.outputAmount.textContent = `Min: ${formatNumber(currentQuote.minAmount, 2)} ${currentQuote.asset}`;
+                updateQuoteBreakdown(null);
                 updateButtonState();
                 return;
             }
             if (currentQuote && currentQuote.error === 'max') {
                 DOM.outputAmount.textContent = `Max: ${formatNumber(currentQuote.maxAmount, 2)} ${currentQuote.asset}`;
+                updateQuoteBreakdown(null);
                 updateButtonState();
                 return;
             }
 
-            // Format output based on asset decimals
-            const toAsset = ASSETS[State.toAsset];
-            const displayDecimals = State.outputAmount >= 1000 ? 2 : (toAsset.decimals > 4 ? 4 : toAsset.decimals);
-            DOM.outputAmount.textContent = formatNumber(State.outputAmount, displayDecimals);
+            updateOutputDisplay();
+            updateQuoteBreakdown(currentQuote);
 
-            // Update rate info with actual amount's settlement time and fees
-            if (currentQuote && !currentQuote.error) {
-                if (currentQuote.confirmations_breakdown) {
-                    const cb = currentQuote.confirmations_breakdown;
-                    if (cb.confirmations === 0) {
-                        DOM.btcFinalityValue.textContent = 'Instant (0-conf)';
-                    } else {
-                        const btcMin = Math.ceil(cb.asset_time / 60);
-                        DOM.btcFinalityValue.textContent = `~${btcMin} min (${cb.confirmations} conf)`;
-                    }
+            // Update BTC finality info
+            if (currentQuote && !currentQuote.error && currentQuote.confirmations_breakdown) {
+                const cb = currentQuote.confirmations_breakdown;
+                if (cb.confirmations === 0) {
+                    DOM.btcFinalityValue.textContent = 'Instant (0-conf)';
+                } else {
+                    const btcMin = Math.ceil(cb.asset_time / 60);
+                    DOM.btcFinalityValue.textContent = `~${btcMin} min (${cb.confirmations} conf)`;
                 }
             }
         } catch (e) {
             console.error('[pna] Quote calculation error:', e);
-            DOM.outputAmount.textContent = '0.00';
+            // On silent refresh error, keep previous values visible
+            if (!silent) {
+                DOM.outputAmount.textContent = '0.00';
+                updateQuoteBreakdown(null);
+            }
         }
         updateButtonState();
-    }, 300);
+    }, delay);
 }
 
 function onAddressChange() {
@@ -1575,17 +1709,68 @@ async function initiateSwapUsdcToBtc() {
         State.currentSwap.evm_htlc_id = htlcResult.htlc_id;
         State.currentSwap.evm_lock_txhash = htlcResult.lock_txhash;
 
-        // Step 7: Notify LP
+        // Step 7: Notify LP (with retry on 503/network failure)
         setStatusMessage('pending', 'USDC locked. Notifying LP...');
         updateStepProgress(2);
 
-        const fundedResp = await fetch(
-            `${getLpUrl()}/api/flowswap/${data.swap_id}/usdc-funded?htlc_id=${htlcResult.htlc_id}`,
-            { method: 'POST' }
-        );
+        let fundedOk = false;
+        const maxRetries = 3;
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                const fundedResp = await fetch(
+                    `${getLpUrl()}/api/flowswap/${data.swap_id}/usdc-funded`,
+                    {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ htlc_id: htlcResult.htlc_id }),
+                    }
+                );
 
-        if (!fundedResp.ok) {
-            console.warn('[pna] usdc-funded notification failed, continuing...');
+                if (fundedResp.ok) {
+                    fundedOk = true;
+                    console.log('[pna] usdc-funded confirmed by LP');
+                    break;
+                }
+
+                const errBody = await fundedResp.json().catch(() => ({}));
+                const detail = errBody.detail || `HTTP ${fundedResp.status}`;
+
+                if (fundedResp.status === 503 && attempt < maxRetries) {
+                    // RPC unavailable — retry after delay
+                    const wait = attempt * 3;
+                    console.warn(`[pna] usdc-funded attempt ${attempt}/${maxRetries}: ${detail} — retry in ${wait}s`);
+                    setStatusMessage('pending', `LP verifying USDC on-chain... retry ${attempt}/${maxRetries}`);
+                    await new Promise(r => setTimeout(r, wait * 1000));
+                    continue;
+                }
+
+                // Non-retryable error (400, 404, etc.) or last retry failed
+                console.error(`[pna] usdc-funded failed: ${detail}`);
+                setStatusMessage('error', `LP verification failed: ${detail}`);
+                break;
+            } catch (netErr) {
+                if (attempt < maxRetries) {
+                    const wait = attempt * 3;
+                    console.warn(`[pna] usdc-funded network error attempt ${attempt}/${maxRetries}: ${netErr} — retry in ${wait}s`);
+                    setStatusMessage('pending', `Network error, retrying... (${attempt}/${maxRetries})`);
+                    await new Promise(r => setTimeout(r, wait * 1000));
+                } else {
+                    console.error('[pna] usdc-funded all retries failed:', netErr);
+                    setStatusMessage('error', 'Cannot reach LP. Your USDC is safe — retry the swap or wait for refund.');
+                }
+            }
+        }
+
+        if (!fundedOk) {
+            // Don't silently continue — show actionable error
+            setStatusMessage('error',
+                'LP could not verify your USDC HTLC. ' +
+                'Your funds are safe and will auto-refund after timelock. ' +
+                'You can also refresh and retry.');
+            btn.classList.remove('loading');
+            btnText.textContent = `Swap USDC \u2192 BTC`;
+            btn.disabled = false;
+            return;
         }
 
         // Step 8: Wait for LP to lock (user-commits-first model)
@@ -2207,7 +2392,7 @@ function delay(ms) {
 // EVENT LISTENERS
 // =============================================================================
 
-DOM.inputAmount.addEventListener('input', onInputChange);
+DOM.inputAmount.addEventListener('input', () => onInputChange(false));
 DOM.destAddress.addEventListener('input', onAddressChange);
 DOM.swapBtn.addEventListener('click', (e) => {
     if (DOM.swapBtn.disabled) {
@@ -2264,6 +2449,7 @@ window.swapDirection = swapDirection;
 window.resetSwap = resetSwap;
 window.notifyBtcFunded = notifyBtcFunded;
 window.copyDepositAddress = copyDepositAddress;
+window.toggleShowAllLPs = toggleShowAllLPs;
 
 // =============================================================================
 // INITIALIZATION
@@ -2272,18 +2458,46 @@ window.copyDepositAddress = copyDepositAddress;
 document.addEventListener('DOMContentLoaded', async () => {
     console.log('[pna] Initializing FlowSwap 3S...');
 
-    // Load LP endpoints from config file (fallback to hardcoded)
+    // Load LP endpoints: try on-chain registry first, fallback to lp-config.json
+    let lpSourceLoaded = false;
     try {
-        const resp = await fetch('lp-config.json', { signal: AbortSignal.timeout(2000) });
-        if (resp.ok) {
-            const lpConfig = await resp.json();
-            if (lpConfig.lp_endpoints && lpConfig.lp_endpoints.length > 0) {
-                CONFIG.SDK_URLS = lpConfig.lp_endpoints.map(lp => lp.url);
-                console.log('[pna] LP endpoints loaded from config:', CONFIG.SDK_URLS);
+        const registryResp = await fetch(
+            `${CONFIG.REGISTRY_URL}/api/registry/lps/online`,
+            { signal: AbortSignal.timeout(CONFIG.REGISTRY_TIMEOUT_MS) }
+        );
+        if (registryResp.ok) {
+            const data = await registryResp.json();
+            if (data.lps && data.lps.length > 0) {
+                CONFIG.LP_REGISTRY = data.lps;
+                CONFIG.SDK_URLS = data.lps
+                    .filter(lp => CONFIG.SHOW_ALL_LPS || lp.tier === 1)
+                    .map(lp => lp.endpoint);
+                // If tier filter removed all LPs, include all
+                if (CONFIG.SDK_URLS.length === 0) {
+                    CONFIG.SDK_URLS = data.lps.map(lp => lp.endpoint);
+                }
+                lpSourceLoaded = true;
+                console.log(`[pna] Registry: ${data.lps.length} LPs discovered (${CONFIG.SDK_URLS.length} active)`);
+                updateTierDisplay();
             }
         }
     } catch (e) {
-        console.warn('[pna] Could not load lp-config.json, using defaults:', e.message);
+        console.warn('[pna] Registry unavailable:', e.message);
+    }
+    // Fallback: lp-config.json
+    if (!lpSourceLoaded) {
+        try {
+            const resp = await fetch('lp-config.json', { signal: AbortSignal.timeout(2000) });
+            if (resp.ok) {
+                const lpConfig = await resp.json();
+                if (lpConfig.lp_endpoints && lpConfig.lp_endpoints.length > 0) {
+                    CONFIG.SDK_URLS = lpConfig.lp_endpoints.map(lp => lp.url);
+                    console.log('[pna] LP endpoints loaded from config:', CONFIG.SDK_URLS);
+                }
+            }
+        } catch (e) {
+            console.warn('[pna] Could not load lp-config.json, using defaults:', e.message);
+        }
     }
 
     // Show loading state
@@ -2302,7 +2516,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     setInterval(async () => {
         if (State.currentSwap) return;
         if (State.inputAmount > 0) {
-            await onInputChange();
+            await onInputChange(true);  // silent refresh: no flash
         } else {
             await updateRateDisplay();
         }

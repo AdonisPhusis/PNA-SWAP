@@ -332,11 +332,72 @@ body::after {
     color: var(--text-secondary);
 }
 
+/* LP Provider Row */
+.lp-provider-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 0;
+    border-top: 1px solid var(--border);
+    margin-top: 16px;
+}
+
+.lp-provider-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.tier-badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+}
+
+.tier-badge.tier-1 {
+    background: rgba(16, 185, 129, 0.15);
+    color: var(--success);
+    border: 1px solid rgba(16, 185, 129, 0.3);
+}
+
+.tier-badge.tier-2 {
+    background: rgba(138, 138, 154, 0.1);
+    color: var(--text-muted);
+    border: 1px solid rgba(138, 138, 154, 0.2);
+}
+
+.lp-count {
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+.show-all-toggle {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+}
+
+.show-all-toggle input[type="checkbox"] {
+    width: 14px;
+    height: 14px;
+    accent-color: var(--accent);
+    cursor: pointer;
+}
+
+.toggle-label {
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
 /* Rate Info */
 .rate-info {
     padding: 16px 0;
     border-top: 1px solid var(--border);
-    margin-top: 16px;
+    margin-top: 0;
 }
 
 .rate-row {
@@ -356,6 +417,45 @@ body::after {
 
 .rate-value.time {
     color: var(--warning);
+}
+
+/* Quote Breakdown */
+.quote-breakdown {
+    padding: 12px 16px;
+    margin-top: 12px;
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+}
+
+.breakdown-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 4px 0;
+    font-size: 13px;
+    color: var(--text-muted);
+}
+
+.breakdown-row .bd-value {
+    color: var(--text-secondary);
+    font-family: monospace;
+    font-size: 12px;
+}
+
+.breakdown-row .bd-highlight {
+    color: var(--text-primary);
+    font-weight: 600;
+    font-size: 13px;
+}
+
+.breakdown-row.bd-detail {
+    font-size: 11px;
+    padding: 2px 0;
+}
+
+.breakdown-row.bd-detail .bd-value {
+    font-size: 11px;
+    color: var(--text-muted);
 }
 
 /* Address Input */
