@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>P&A - Trustless Cross-Chain Settlement</title>
     <link rel="icon" href="img/pna-logo.jpg">
-    <link rel="stylesheet" href="css/style.css?v=27">
+    <link rel="stylesheet" href="css/style.css?v=34">
 </head>
 <body>
     <div class="container">
@@ -18,16 +18,10 @@
             <div class="tagline">Trustless Cross-Chain Settlement</div>
         </header>
 
-        <!-- Tab Navigation -->
-        <nav class="tab-nav">
-            <button class="tab-btn active" data-tab="swap" onclick="switchTab('swap')">Swap</button>
-            <button class="tab-btn" data-tab="lps" onclick="switchTab('lps')">LP Explorer</button>
-        </nav>
-
         <!-- ============================================================ -->
-        <!-- TAB: Swap -->
+        <!-- Swap -->
         <!-- ============================================================ -->
-        <div id="tab-swap" class="tab-content active">
+        <div id="tab-swap">
 
             <!-- Main Swap Card -->
             <main class="swap-card">
@@ -189,22 +183,6 @@
 
         </div><!-- /tab-swap -->
 
-        <!-- ============================================================ -->
-        <!-- TAB: LP Explorer -->
-        <!-- ============================================================ -->
-        <div id="tab-lps" class="tab-content">
-
-            <section class="lp-explorer-page">
-                <div class="lp-explorer-header">
-                    <h3 class="section-heading">Liquidity Providers</h3>
-                    <div class="lp-explorer-summary" id="lp-explorer-summary"></div>
-                </div>
-                <div id="lp-explorer-list" class="explorer-list">
-                    <div class="explorer-empty">Discovering LPs...</div>
-                </div>
-            </section>
-
-        </div><!-- /tab-lps -->
 
         <!-- Asset Selection Modal -->
         <div id="asset-modal" class="modal hidden">
@@ -310,10 +288,61 @@
             </div>
         </div>
 
+        <!-- Verification Modal (shown before user sends S_user) -->
+        <div id="verify-modal" class="modal hidden">
+            <div class="modal-backdrop"></div>
+            <div class="modal-content verify-modal-content">
+                <div class="modal-header">
+                    <h3>Verify LP Locks</h3>
+                </div>
+                <div class="verify-body">
+                    <div class="verify-row verify-highlight">
+                        <span class="verify-label">USDC Locked</span>
+                        <span class="verify-value" id="verify-usdc-amount">-</span>
+                    </div>
+                    <div class="verify-row">
+                        <span class="verify-label">USDC HTLC</span>
+                        <a id="verify-evm-link" class="verify-link" target="_blank" rel="noopener">View on Basescan</a>
+                    </div>
+                    <div class="verify-divider"></div>
+                    <div class="verify-row">
+                        <span class="verify-label">H_user</span>
+                        <code class="verify-hash" id="verify-h-user">-</code>
+                    </div>
+                    <div class="verify-row">
+                        <span class="verify-label">H_lp1</span>
+                        <code class="verify-hash" id="verify-h-lp1">-</code>
+                    </div>
+                    <div class="verify-row">
+                        <span class="verify-label">H_lp2</span>
+                        <code class="verify-hash" id="verify-h-lp2">-</code>
+                    </div>
+                    <div class="verify-divider"></div>
+                    <div class="verify-row">
+                        <span class="verify-label">Your BTC TX</span>
+                        <a id="verify-btc-link" class="verify-link" target="_blank" rel="noopener">View on mempool</a>
+                    </div>
+                </div>
+                <div id="verify-warning" class="verify-warning hidden">
+                    <span id="verify-warning-text"></span>
+                </div>
+                <div class="verify-actions">
+                    <button id="verify-confirm-btn" class="swap-btn" onclick="confirmPresign()">
+                        <span class="btn-text">Confirm &amp; Complete Swap</span>
+                    </button>
+                    <button class="secondary-btn verify-cancel-btn" onclick="cancelPresign()">
+                        Cancel (refund after timeout)
+                    </button>
+                </div>
+            </div>
+        </div>
+
         <!-- Footer -->
         <footer class="footer">
             <div class="footer-links">
-                <a href="http://57.131.33.151:3001/" target="_blank">Explorer</a>
+                <a href="/exploreur/">LP Explorer</a>
+                <span class="sep">&bull;</span>
+                <a href="http://57.131.33.151:3001/" target="_blank">Block Explorer</a>
                 <span class="sep">&bull;</span>
                 <a href="https://github.com/AdonisPhusis/BATHRON" target="_blank">GitHub</a>
                 <span class="sep">&bull;</span>
@@ -326,6 +355,6 @@
     </div>
 
     <script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.13.4/ethers.umd.min.js" crossorigin="anonymous"></script>
-    <script src="js/pna.js?v=27"></script>
+    <script src="js/pna.js?v=34"></script>
 </body>
 </html>

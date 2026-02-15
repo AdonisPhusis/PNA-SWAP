@@ -184,6 +184,163 @@ function getLpUrl() {
 }
 
 // =============================================================================
+// SESSION PERSISTENCE (sessionStorage)
+// =============================================================================
+
+/**
+ * Save active swap state to sessionStorage so it survives page refresh.
+ * SECURITY: S_user is stored in sessionStorage (tab-scoped, cleared on tab close).
+ */
+function saveSwapSession() {
+    if (!State.currentSwap || !State.S_user) return;
+    try {
+        const session = {
+            S_user: State.S_user,
+            swap: State.currentSwap,
+            lpUrl: State.activeLpUrl,
+            ts: Date.now(),
+        };
+        sessionStorage.setItem('pna_swap_session', JSON.stringify(session));
+    } catch (e) {
+        console.warn('[pna] Failed to save swap session:', e);
+    }
+}
+
+/**
+ * Restore swap session from sessionStorage (called on page load).
+ * Returns the session object or null if none/expired.
+ */
+function loadSwapSession() {
+    try {
+        const raw = sessionStorage.getItem('pna_swap_session');
+        if (!raw) return null;
+        const session = JSON.parse(raw);
+        // Expire after 2 hours (max HTLC lifetime)
+        if (Date.now() - session.ts > 2 * 60 * 60 * 1000) {
+            sessionStorage.removeItem('pna_swap_session');
+            return null;
+        }
+        if (!session.S_user || !session.swap || !session.swap.swap_id) return null;
+        return session;
+    } catch (e) {
+        console.warn('[pna] Failed to load swap session:', e);
+        return null;
+    }
+}
+
+/**
+ * Clear saved swap session (on completion, reset, or expiry).
+ */
+function clearSwapSession() {
+    sessionStorage.removeItem('pna_swap_session');
+}
+
+// =============================================================================
+// WEBSOCKET CLIENT
+// =============================================================================
+
+class PnaWebSocket {
+    constructor(url, handlers) {
+        this.url = url;
+        this.handlers = handlers;  // {type: callback}
+        this.ws = null;
+        this.reconnectDelay = 1000;
+        this.maxReconnectDelay = 30000;
+        this.subs = {};
+        this._closed = false;
+    }
+
+    connect() {
+        if (this._closed) return;
+        try {
+            this.ws = new WebSocket(this.url);
+        } catch (e) {
+            console.warn(`[ws] Failed to create WebSocket for ${this.url}:`, e);
+            this._scheduleReconnect();
+            return;
+        }
+
+        this.ws.onopen = () => {
+            console.log(`[ws] Connected: ${this.url}`);
+            this.reconnectDelay = 1000;
+            // Restore subscriptions
+            for (const [channel, data] of Object.entries(this.subs)) {
+                this.ws.send(JSON.stringify({ type: 'subscribe', channel, data }));
+            }
+            // Start keepalive pings every 25s
+            this._startPing();
+        };
+
+        this.ws.onmessage = (event) => {
+            try {
+                const msg = JSON.parse(event.data);
+                const handler = this.handlers[msg.type];
+                if (handler) handler(msg.data, msg);
+            } catch (e) {
+                console.warn('[ws] Parse error:', e);
+            }
+        };
+
+        this.ws.onclose = () => {
+            this._stopPing();
+            this._scheduleReconnect();
+        };
+
+        this.ws.onerror = () => {};
+    }
+
+    subscribe(channel, data = {}) {
+        this.subs[channel] = data;
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+            this.ws.send(JSON.stringify({ type: 'subscribe', channel, data }));
+        }
+    }
+
+    unsubscribe(channel) {
+        delete this.subs[channel];
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+            this.ws.send(JSON.stringify({ type: 'unsubscribe', channel }));
+        }
+    }
+
+    get connected() {
+        return this.ws && this.ws.readyState === WebSocket.OPEN;
+    }
+
+    close() {
+        this._closed = true;
+        if (this.ws) this.ws.close();
+    }
+
+    _startPing() {
+        this._stopPing();
+        this._pingTimer = setInterval(() => {
+            if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                try { this.ws.send(JSON.stringify({ type: 'ping' })); } catch (e) {}
+            }
+        }, 25000);
+    }
+
+    _stopPing() {
+        if (this._pingTimer) {
+            clearInterval(this._pingTimer);
+            this._pingTimer = null;
+        }
+    }
+
+    _scheduleReconnect() {
+        if (this._closed) return;
+        setTimeout(() => this.connect(), this.reconnectDelay);
+        this.reconnectDelay = Math.min(this.reconnectDelay * 2, this.maxReconnectDelay);
+    }
+}
+
+// WS instances (initialized in DOMContentLoaded)
+let registryWs = null;
+let lpWebSockets = {};  // url -> PnaWebSocket
+let lpWsInfoCache = {}; // url -> { info: lp_info data, inventory: {btc, m1, usdc, ...}, ts: timestamp }
+
+// =============================================================================
 // DOM ELEMENTS
 // =============================================================================
 
@@ -221,6 +378,17 @@ const DOM = {
     // Modal
     assetModal: document.getElementById('asset-modal'),
     assetList: document.getElementById('asset-list'),
+    // Verification modal
+    verifyModal: document.getElementById('verify-modal'),
+    verifyUsdcAmount: document.getElementById('verify-usdc-amount'),
+    verifyEvmLink: document.getElementById('verify-evm-link'),
+    verifyHUser: document.getElementById('verify-h-user'),
+    verifyHLp1: document.getElementById('verify-h-lp1'),
+    verifyHLp2: document.getElementById('verify-h-lp2'),
+    verifyBtcLink: document.getElementById('verify-btc-link'),
+    verifyWarning: document.getElementById('verify-warning'),
+    verifyWarningText: document.getElementById('verify-warning-text'),
+    verifyConfirmBtn: document.getElementById('verify-confirm-btn'),
 };
 
 // =============================================================================
@@ -883,6 +1051,7 @@ function toggleShowAllLPs() {
             CONFIG.SDK_URLS = CONFIG.LP_REGISTRY.map(lp => lp.endpoint);
         }
         console.log(`[pna] Show all: ${CONFIG.SHOW_ALL_LPS}, active LPs: ${CONFIG.SDK_URLS.length}`);
+        connectLPWebSockets();
         fetchLPInfo();
         updateTierDisplay();
     }
@@ -1319,13 +1488,22 @@ function startPerLegPolling() {
         clearInterval(State.statusInterval);
     }
 
+    // Subscribe via WS for instant state updates
+    if (State.currentSwap) {
+        wsSubscribeSwap(State.currentSwap.swap_id);
+    }
+
     State.statusInterval = setInterval(async () => {
         if (!State.currentSwap || !State.currentSwap.is_perleg) return;
+
+        // Skip HTTP poll if WS is connected (WS handles real-time)
+        const lpWs = lpWebSockets[State.currentSwap.lp_in_url];
+        if (lpWs && lpWs.connected) return;
 
         const swap = State.currentSwap;
 
         try {
-            // Poll LP_IN status
+            // Poll LP_IN status (HTTP fallback)
             const inResp = await fetch(`${swap.lp_in_url}/api/flowswap/${swap.swap_id}`);
             if (!inResp.ok) return;
             const inData = await inResp.json();
@@ -1617,6 +1795,7 @@ async function initiateSwapBtcToUsdc() {
 
         showFlowSwapStatus(State.currentSwap);
         startFlowSwapPolling(data.swap_id);
+        saveSwapSession();
 
     } catch (error) {
         console.error('[pna] FlowSwap init error:', error);
@@ -1875,8 +2054,16 @@ function startFlowSwapPolling(swapId) {
         clearInterval(State.statusInterval);
     }
 
+    // Subscribe via WS for instant state updates
+    wsSubscribeSwap(swapId);
+
+    // HTTP fallback polling (slower interval when WS connected)
     State.statusInterval = setInterval(async () => {
         if (!State.currentSwap) return;
+
+        // If WS connected, reduce poll frequency (WS handles real-time)
+        const lpWs = lpWebSockets[getLpUrl()];
+        if (lpWs && lpWs.connected) return;
 
         try {
             const response = await fetch(`${getLpUrl()}/api/flowswap/${swapId}`);
@@ -1901,6 +2088,9 @@ function handleFlowSwapStateChange(data) {
     if (prevState === data.state && data.state !== 'btc_funded') return;
 
     console.log(`[pna] State: ${prevState} -> ${data.state}`);
+
+    // Persist swap state to sessionStorage (survives page refresh)
+    saveSwapSession();
 
     const isReverse = swap.direction === 'reverse';
 
@@ -1953,8 +2143,11 @@ function handleFlowSwapStateChange(data) {
                 showTxLink('btc', data.btc.fund_txid);
             }
 
-            // Now safe to presign — LP has committed on-chain
-            autoPresign();
+            // Show verification popup — user must confirm before sending S_user
+            if (!State._verifyPending) {
+                State._verifyPending = true;
+                showVerifyModal(data);
+            }
             break;
 
         case 'btc_claimed':
@@ -1989,6 +2182,7 @@ function handleFlowSwapStateChange(data) {
 
         // --- Common terminal states ---
         case 'expired':
+            clearSwapSession();
             setStatusMessage('error', 'Plan expired. No funds were locked by LP.');
             DOM.newSwapBtn.classList.remove('hidden');
             DOM.btcSentBtn.classList.add('hidden');
@@ -2016,6 +2210,7 @@ function handleFlowSwapStateChange(data) {
             break;
 
         case 'completed':
+            clearSwapSession();
             updateStepProgress(4);
             DOM.depositBox.classList.add('hidden');
 
@@ -2044,6 +2239,7 @@ function handleFlowSwapStateChange(data) {
             break;
 
         case 'failed':
+            clearSwapSession();
             setStatusMessage('error', isReverse
                 ? 'Swap failed. USDC is safe if HTLC was not created.'
                 : 'Swap failed. Your BTC is safe if unfunded.');
@@ -2057,6 +2253,7 @@ function handleFlowSwapStateChange(data) {
             break;
 
         case 'refunded': {
+            clearSwapSession();
             const refundTxid = data.btc?.refund_txid || '';
             const refundAddr = data.btc?.refund_address || '';
             let refundMsg = 'Swap timed out. BTC auto-refunded.';
@@ -2145,6 +2342,7 @@ async function notifyBtcFunded() {
 /**
  * Auto-send S_user to LP after LP has locked on-chain (lp_locked state).
  * LP uses all 3 secrets to claim BTC -> USDC auto-claims.
+ * GUARD: Only runs if user explicitly confirmed via verify modal (_verifyPending flag).
  */
 async function autoPresign() {
     if (!State.currentSwap || !State.S_user) return;
@@ -2165,7 +2363,9 @@ async function autoPresign() {
         if (!response.ok) {
             const error = await response.json();
             console.error('[pna] Presign failed:', error);
-            // Don't show error to user — polling will catch state changes
+            setStatusMessage('error', `Presign failed: ${error.detail || 'Unknown error'}. Retrying...`);
+            // Re-show verify modal so user can retry
+            State._verifyPending = true;
             return;
         }
 
@@ -2182,6 +2382,107 @@ async function autoPresign() {
     } catch (e) {
         console.error('[pna] Presign error:', e);
     }
+}
+
+/**
+ * Show verification modal before sending S_user.
+ * Displays LP lock details so the user can verify before committing.
+ */
+function showVerifyModal(data) {
+    if (!State.currentSwap) return;
+    const swap = State.currentSwap;
+
+    // Populate USDC amount
+    const usdcAmount = data.usdc_amount || swap.usdc_amount || swap.to_amount || 0;
+    DOM.verifyUsdcAmount.textContent = `${usdcAmount} USDC`;
+
+    // EVM HTLC link (lock TX on Basescan)
+    const evmLockTx = (data.evm && data.evm.lock_txhash) || '';
+    const evmHtlcId = (data.evm && data.evm.htlc_id) || swap.evm_htlc_id || '';
+    const contractAddr = (data.evm && data.evm.contract_address) || '';
+    if (evmLockTx) {
+        DOM.verifyEvmLink.href = `https://sepolia.basescan.org/tx/${evmLockTx}`;
+        DOM.verifyEvmLink.textContent = 'View on Basescan';
+    } else if (contractAddr && evmHtlcId) {
+        DOM.verifyEvmLink.href = `https://sepolia.basescan.org/address/${contractAddr}`;
+        DOM.verifyEvmLink.textContent = 'View contract';
+    } else {
+        DOM.verifyEvmLink.removeAttribute('href');
+        DOM.verifyEvmLink.textContent = 'Pending...';
+    }
+
+    // Hashlocks
+    const hUser = (data.hashlocks && data.hashlocks.H_user) || swap.H_user || '';
+    const hLp1 = (data.hashlocks && data.hashlocks.H_lp1) || swap.H_lp1 || '';
+    const hLp2 = (data.hashlocks && data.hashlocks.H_lp2) || swap.H_lp2 || '';
+    DOM.verifyHUser.textContent = hUser ? hUser.slice(0, 16) + '...' : '-';
+    DOM.verifyHUser.title = hUser;
+    DOM.verifyHLp1.textContent = hLp1 ? hLp1.slice(0, 16) + '...' : '-';
+    DOM.verifyHLp1.title = hLp1;
+    DOM.verifyHLp2.textContent = hLp2 ? hLp2.slice(0, 16) + '...' : '-';
+    DOM.verifyHLp2.title = hLp2;
+
+    // BTC deposit TX
+    const btcFundTxid = (data.btc && data.btc.fund_txid) || '';
+    if (btcFundTxid) {
+        DOM.verifyBtcLink.href = `https://mempool.space/signet/tx/${btcFundTxid}`;
+        DOM.verifyBtcLink.textContent = btcFundTxid.slice(0, 16) + '...';
+    } else {
+        DOM.verifyBtcLink.removeAttribute('href');
+        DOM.verifyBtcLink.textContent = '-';
+    }
+
+    // Validation warnings
+    const warnings = [];
+    const expectedUsdc = parseFloat(swap.to_amount || swap.usdc_amount || 0);
+    if (expectedUsdc > 0 && usdcAmount > 0) {
+        const diff = Math.abs(usdcAmount - expectedUsdc) / expectedUsdc;
+        if (diff > 0.01) {
+            warnings.push(`USDC amount mismatch: expected ${expectedUsdc}, got ${usdcAmount}`);
+        }
+    }
+    if (!hUser || !hLp1 || !hLp2) {
+        warnings.push('Missing hashlock(s) — LP may not have locked correctly');
+    }
+    if (!evmHtlcId && !evmLockTx) {
+        warnings.push('No EVM HTLC detected — USDC may not be locked');
+    }
+
+    if (warnings.length > 0) {
+        DOM.verifyWarningText.textContent = warnings.join('. ');
+        DOM.verifyWarning.classList.remove('hidden');
+    } else {
+        DOM.verifyWarning.classList.add('hidden');
+    }
+
+    // Show the modal
+    DOM.verifyModal.classList.remove('hidden');
+    setStatusMessage('pending', 'LP locked. Verify details and confirm swap.');
+
+    console.log('[pna] Verification modal shown', { usdcAmount, evmLockTx, hUser: hUser.slice(0, 16) });
+}
+
+/**
+ * User confirmed the LP locks — proceed with presign (send S_user).
+ */
+function confirmPresign() {
+    State._verifyPending = false;
+    // Hide verify modal
+    DOM.verifyModal.classList.add('hidden');
+    // Proceed with actual presign
+    autoPresign();
+}
+
+/**
+ * User cancelled — do not send S_user. BTC will refund after HTLC timeout.
+ */
+function cancelPresign() {
+    State._verifyPending = false;
+    DOM.verifyModal.classList.add('hidden');
+    setStatusMessage('error', 'Swap cancelled. Your BTC will refund after HTLC timeout.');
+    DOM.newSwapBtn.classList.remove('hidden');
+    clearSwapSession();
+    console.log('[pna] User cancelled presign — S_user NOT sent');
 }
 
 /**
@@ -2214,6 +2515,7 @@ function copyDepositAddress() {
 // =============================================================================
 
 function resetSwap() {
+    clearSwapSession();
     State.currentSwap = null;
     State.S_user = null;
     State.activeLpUrl = null;
@@ -2405,88 +2707,275 @@ async function loadLPExplorer() {
         return;
     }
 
-    // Update summary
-    const summary = document.getElementById('lp-explorer-summary');
-    if (summary) {
-        const online = CONFIG.LP_REGISTRY.filter(lp => lp.status === 'online' || lp.status === 'new').length;
-        const tier1 = CONFIG.LP_REGISTRY.filter(lp => lp.tier === 1).length;
-        summary.textContent = `${CONFIG.LP_REGISTRY.length} registered \u00b7 ${online} online \u00b7 ${tier1} operator-backed`;
-    }
+    updateLPExplorerSummary();
 
-    // Fetch /api/lp/info from each LP in parallel for live data
+    // Fetch info via HTTP for LPs not yet in WS cache
+    const needsHttpFetch = CONFIG.LP_REGISTRY.filter(lp => !lpWsInfoCache[lp.endpoint]?.info);
     const infoResults = await Promise.allSettled(
-        CONFIG.LP_REGISTRY.map(lp =>
+        needsHttpFetch.map(lp =>
             fetch(`${lp.endpoint}/api/lp/info`, { signal: AbortSignal.timeout(CONFIG.LP_TIMEOUT_MS) })
                 .then(r => r.ok ? r.json() : null)
                 .catch(() => null)
         )
     );
+    needsHttpFetch.forEach((lp, i) => {
+        const result = infoResults[i]?.status === 'fulfilled' ? infoResults[i].value : null;
+        if (result) {
+            if (!lpWsInfoCache[lp.endpoint]) lpWsInfoCache[lp.endpoint] = {};
+            lpWsInfoCache[lp.endpoint].info = result;
+            lpWsInfoCache[lp.endpoint].ts = Date.now();
+        }
+    });
 
-    container.innerHTML = CONFIG.LP_REGISTRY.map((lp, i) => {
-        const info = infoResults[i]?.status === 'fulfilled' ? infoResults[i].value : null;
-        const cached = lp.cached_info || {};
+    container.innerHTML = CONFIG.LP_REGISTRY.map(lp => buildLPCardHTML(lp)).join('');
+}
 
-        const name = info?.name || cached?.lp_id || lp.address?.slice(0, 12) || 'Unknown LP';
-        const status = lp.status || 'offline';
-        const tier = lp.tier || 2;
-        const tierLabel = tier === 1 ? 'Operator' : 'Community';
-        const tierClass = tier === 1 ? 'tier-1' : 'tier-2';
+function updateLPExplorerSummary() {
+    const summary = document.getElementById('lp-explorer-summary');
+    if (!summary) return;
+    const online = CONFIG.LP_REGISTRY.filter(lp => lp.status === 'online' || lp.status === 'new').length;
+    const tier1 = CONFIG.LP_REGISTRY.filter(lp => lp.tier === 1).length;
+    summary.textContent = `${CONFIG.LP_REGISTRY.length} registered \u00b7 ${online} online \u00b7 ${tier1} operator-backed`;
+}
 
-        // Pairs from live info
-        const pairs = info?.pairs ? Object.keys(info.pairs) : [];
-        const pairPills = pairs.map(p => `<span class="lp-pair-pill">${p}</span>`).join('');
+/**
+ * LP card — clean and minimal. Click opens detail page.
+ */
+function buildLPCardHTML(lp) {
+    const wsCache = lpWsInfoCache[lp.endpoint] || {};
+    const info = wsCache.info || null;
+    const cached = lp.cached_info || {};
+    const wsConnected = lpWebSockets[lp.endpoint]?.connected || false;
 
-        // Inventory from live info (boolean flags)
-        const inv = info?.inventory || {};
-        const invItems = ['btc', 'm1', 'usdc'].map(asset => {
-            const avail = inv[asset] ? 'available' : 'unavailable';
-            return `<span class="lp-inv-item"><span class="lp-inv-dot ${avail}"></span>${asset.toUpperCase()}</span>`;
+    const name = info?.name || cached?.name || cached?.lp_id || lp.address?.slice(0, 12) || 'Unknown LP';
+    const status = lp.status || 'offline';
+    const tier = lp.tier || 2;
+    const tierLabel = tier === 1 ? 'Operator' : 'Community';
+    const tierClass = tier === 1 ? 'tier-1' : 'tier-2';
+
+    // Pair pills — use WS info, fallback to registry cached_info
+    const pairsObj = info?.pairs || cached?.pairs || {};
+    const pairs = Object.keys(pairsObj);
+    const pairPills = pairs.map(p => `<span class="lp-pair-pill">${p}</span>`).join('');
+
+    // Inventory dots — derive assets from LP's pairs
+    const inv = info?.inventory || cached?.inventory || {};
+    const lpAssets = new Set();
+    pairs.forEach(p => p.split('/').forEach(a => lpAssets.add(a.toLowerCase())));
+    if (lpAssets.size === 0) ['btc', 'm1', 'usdc'].forEach(a => lpAssets.add(a));
+    const invDots = [...lpAssets].map(asset => {
+        const avail = inv[asset + '_available'] !== false;
+        return `<span class="lp-inv-item"><span class="lp-inv-dot ${avail ? 'available' : 'unavailable'}"></span>${asset.toUpperCase()}</span>`;
+    }).join('');
+
+    // Connection indicator — consistent between cards and detail
+    const connTag = wsConnected
+        ? '<span class="lp-live-tag">LIVE</span>'
+        : '<span class="lp-http-tag">HTTP</span>';
+
+    return `
+    <div class="lp-card" data-lp-endpoint="${lp.endpoint}" onclick="openLPDetail('${lp.endpoint}')">
+        <div class="lp-header">
+            <span class="lp-status-dot ${status}"></span>
+            <span class="lp-name">${name}</span>
+            ${connTag}
+            <span class="tier-badge ${tierClass}">${tierLabel}</span>
+            <span class="lp-status-label">${status}</span>
+        </div>
+        ${pairPills ? `<div class="lp-pairs">${pairPills}</div>` : ''}
+        <div class="lp-inventory">${invDots}</div>
+    </div>`;
+}
+
+/**
+ * Format a rate number for display (compact).
+ */
+function formatRateNum(n) {
+    if (n == null || isNaN(n)) return '-';
+    if (n >= 10000) return n.toFixed(0).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+    if (n >= 100) return n.toFixed(2);
+    if (n >= 1) return n.toFixed(4);
+    if (n >= 0.0001) return n.toFixed(6);
+    return n.toFixed(8);
+}
+
+/**
+ * Open the full LP detail page (switches to LP Detail tab).
+ */
+function openLPDetail(endpoint) {
+    const lp = CONFIG.LP_REGISTRY.find(l => l.endpoint === endpoint);
+    if (!lp) return;
+
+    const detailTab = document.getElementById('tab-lpdetail');
+    const title = document.getElementById('lp-detail-title');
+    const body = document.getElementById('lp-detail-body');
+    const emptyState = document.getElementById('lpd-empty-state');
+    if (!detailTab || !body) return;
+
+    detailTab.dataset.endpoint = endpoint;
+
+    const wsCache = lpWsInfoCache[endpoint] || {};
+    const info = wsCache.info || null;
+    const liveInv = wsCache.inventory || null;
+    const cached = lp.cached_info || {};
+    const wsConnected = lpWebSockets[endpoint]?.connected || false;
+
+    const name = info?.name || cached?.lp_id || lp.address?.slice(0, 12) || 'Unknown LP';
+    if (title) title.textContent = name;
+
+    body.innerHTML = buildLPDetailHTML(lp, info, liveInv, cached, wsConnected);
+    if (emptyState) emptyState.style.display = 'none';
+
+    switchTab('lpdetail');
+}
+
+function closeLPDetail() {
+    const detailTab = document.getElementById('tab-lpdetail');
+    if (detailTab) delete detailTab.dataset.endpoint;
+    // Clear stale content
+    const body = document.getElementById('lp-detail-body');
+    if (body) body.innerHTML = '';
+    const emptyState = document.getElementById('lpd-empty-state');
+    if (emptyState) emptyState.style.display = '';
+    switchTab('lps');
+}
+window.closeLPDetail = closeLPDetail;
+
+/**
+ * Build the full detail page content for an LP.
+ * Single unified table: Pair | Bid | Ask | Min | Max | Available | Swaps | Success | Uptime
+ */
+function buildLPDetailHTML(lp, info, liveInv, cached, wsConnected) {
+    const status = lp.status || 'offline';
+    const tier = lp.tier || 2;
+    const tierLabel = tier === 1 ? 'Operator' : 'Community';
+    const tierClass = tier === 1 ? 'tier-1' : 'tier-2';
+    const version = info?.version || cached?.version || '-';
+
+    // --- Status bar ---
+    let statusHTML = `
+    <div class="lpd-status-bar">
+        <span class="lp-status-dot ${status}"></span>
+        <span class="lpd-status-text">${status}</span>
+        <span class="tier-badge ${tierClass}">${tierLabel}</span>
+        ${wsConnected ? '<span class="lp-live-tag">LIVE</span>' : '<span class="lpd-no-ws">HTTP</span>'}
+        <span class="lpd-version">v${version}</span>
+    </div>`;
+
+    // --- LP-level stats ---
+    const rep = cached?.reputation || {};
+    const totalSwaps = info?.stats?.swaps_completed || cached?.swaps_total || 0;
+    const successRate = rep.success_rate != null ? Math.round(rep.success_rate * 100) + '%' : '-';
+    const uptimeHrs = info?.stats?.uptime_hours != null ? info.stats.uptime_hours.toFixed(1) + 'h' : '-';
+
+    // --- Unified table: one row per pair ---
+    const pairs = info?.pairs ? Object.entries(info.pairs) : [];
+    let tableHTML = '';
+    if (pairs.length > 0) {
+        const rowCount = pairs.length;
+        const rows = pairs.map(([pairKey, p], idx) => {
+            const minVal = p.min != null ? formatRateNum(p.min) : '-';
+            const maxVal = p.max != null && p.max < 1e12 ? formatRateNum(p.max) : '-';
+
+            // Available: look up base asset inventory
+            const baseAsset = pairKey.split('/')[0].toLowerCase();
+            const amount = liveInv ? liveInv[baseAsset] : null;
+            const boolAvail = info?.inventory?.[baseAsset + '_available'] !== false;
+            let availText = '-';
+            if (amount != null) {
+                if (baseAsset === 'btc') availText = amount.toFixed(8);
+                else if (baseAsset === 'm1') availText = Math.round(amount).toLocaleString();
+                else availText = formatNumber(amount, 2);
+            }
+            const availClass = (amount != null ? amount > 0 : boolAvail) ? 'lpd-avail-ok' : 'lpd-avail-empty';
+
+            // LP-level stats: rowspan on first row only
+            const statsCell = idx === 0
+                ? `<td class="lpd-stat-cell" rowspan="${rowCount}">${totalSwaps}</td>
+                   <td class="lpd-stat-cell" rowspan="${rowCount}">${successRate}</td>
+                   <td class="lpd-stat-cell" rowspan="${rowCount}">${uptimeHrs}</td>`
+                : '';
+
+            return `<tr>
+                <td class="lpd-pair-name">${pairKey}</td>
+                <td class="lpd-rate-bid">${formatRateNum(p.rate_bid)}</td>
+                <td class="lpd-rate-ask">${formatRateNum(p.rate_ask)}</td>
+                <td class="lpd-minmax">${minVal}</td>
+                <td class="lpd-minmax">${maxVal}</td>
+                <td class="${availClass}">${availText}</td>
+                ${statsCell}
+            </tr>`;
         }).join('');
 
-        // Stats from cached_info (registry health check)
-        const rep = cached?.reputation || {};
-        const totalSwaps = cached?.swaps_total || 0;
-        const successRate = rep.success_rate != null ? Math.round(rep.success_rate * 100) : '-';
-        const version = cached?.version || '-';
-
-        // Detail section
-        const addrShort = lp.address ? `${lp.address.slice(0, 8)}...${lp.address.slice(-4)}` : '-';
-        const addrFull = lp.address || '';
-        const txidShort = lp.txid ? `${lp.txid.slice(0, 12)}...${lp.txid.slice(-4)}` : '-';
-
-        return `
-        <div class="lp-card" onclick="toggleLPDetail(this)">
-            <div class="lp-header">
-                <span class="lp-status-dot ${status}"></span>
-                <span class="lp-name">${name}</span>
-                <span class="tier-badge ${tierClass}">${tierLabel}</span>
-                <span class="lp-status-label">${status}</span>
-            </div>
-            ${pairPills ? `<div class="lp-pairs">${pairPills}</div>` : ''}
-            <div class="lp-inventory">${invItems}</div>
-            <div class="lp-stats">
-                <span>${totalSwaps} swap${totalSwaps !== 1 ? 's' : ''}</span>
-                <span class="lp-stat-sep">\u00b7</span>
-                <span>${successRate}% success</span>
-                <span class="lp-stat-sep">\u00b7</span>
-                <span>v${version}</span>
-            </div>
-            <div class="lp-detail hidden">
-                <div class="lp-detail-row"><span>Address</span><code title="${addrFull}">${addrShort}</code></div>
-                <div class="lp-detail-row"><span>Endpoint</span><a href="${lp.endpoint}" target="_blank" rel="noopener">${lp.endpoint}</a></div>
-                ${lp.txid ? `<div class="lp-detail-row"><span>Reg TX</span><code title="${lp.txid}">${txidShort}</code></div>` : ''}
-                ${lp.height ? `<div class="lp-detail-row"><span>Registered</span><span>Block ${lp.height}</span></div>` : ''}
+        tableHTML = `
+        <div class="lpd-section">
+            <div class="lpd-table-scroll">
+            <table class="lpd-table lpd-unified">
+                <thead><tr>
+                    <th>Pair</th><th>Bid</th><th>Ask</th><th>Min</th><th>Max</th><th>Available</th>
+                    <th>Swaps</th><th>Success</th><th>Uptime</th>
+                </tr></thead>
+                <tbody>${rows}</tbody>
+            </table>
             </div>
         </div>`;
-    }).join('');
+    } else {
+        tableHTML = `<div class="lpd-section"><div class="explorer-empty">No pairs configured</div></div>`;
+    }
+
+    // --- On-chain info ---
+    const addrFull = lp.address || '-';
+
+    const chainHTML = `
+    <div class="lpd-section">
+        <h4 class="lpd-section-title">On-chain</h4>
+        <div class="lpd-kv-list">
+            <div class="lpd-kv"><span class="lpd-k">Address</span><code class="lpd-v">${addrFull}</code></div>
+            <div class="lpd-kv"><span class="lpd-k">Endpoint</span><a href="${lp.endpoint}" target="_blank" rel="noopener" class="lpd-v">${lp.endpoint}</a></div>
+            ${lp.txid ? `<div class="lpd-kv"><span class="lpd-k">Registration TX</span><code class="lpd-v">${lp.txid}</code></div>` : ''}
+            ${lp.height ? `<div class="lpd-kv"><span class="lpd-k">Registered at</span><span class="lpd-v">Block ${lp.height}</span></div>` : ''}
+        </div>
+    </div>`;
+
+    return statusHTML + tableHTML + chainHTML;
 }
 
-function toggleLPDetail(el) {
-    const detail = el.querySelector('.lp-detail');
-    if (detail) detail.classList.toggle('hidden');
+/**
+ * Live-update LP card or detail page when WS data arrives.
+ */
+function updateLPExplorerCard(endpoint) {
+    // Update card in list
+    if (State._lpExplorerLoaded) {
+        const card = document.querySelector(`.lp-card[data-lp-endpoint="${endpoint}"]`);
+        if (card) {
+            const lp = CONFIG.LP_REGISTRY.find(l => l.endpoint === endpoint);
+            if (lp) {
+                const temp = document.createElement('div');
+                temp.innerHTML = buildLPCardHTML(lp);
+                card.replaceWith(temp.firstElementChild);
+            }
+        }
+        updateLPExplorerSummary();
+    }
+
+    // Update detail tab if open on this LP
+    const detailTab = document.getElementById('tab-lpdetail');
+    if (detailTab && detailTab.classList.contains('active') && detailTab.dataset.endpoint === endpoint) {
+        const lp = CONFIG.LP_REGISTRY.find(l => l.endpoint === endpoint);
+        if (lp) {
+            const wsCache = lpWsInfoCache[endpoint] || {};
+            const body = document.getElementById('lp-detail-body');
+            if (body) {
+                body.innerHTML = buildLPDetailHTML(
+                    lp, wsCache.info || null, wsCache.inventory || null,
+                    lp.cached_info || {}, lpWebSockets[endpoint]?.connected || false
+                );
+            }
+        }
+    }
 }
 
-window.toggleLPDetail = toggleLPDetail;
+window.openLPDetail = openLPDetail;
 
 // =============================================================================
 // UTILITIES
@@ -2576,58 +3065,266 @@ window.toggleShowAllLPs = toggleShowAllLPs;
 // INITIALIZATION
 // =============================================================================
 
+/**
+ * Apply LP list from registry data (used by both WS and HTTP).
+ */
+function applyRegistryLPs(lps) {
+    CONFIG.LP_REGISTRY = lps;
+    CONFIG.SDK_URLS = lps
+        .filter(lp => CONFIG.SHOW_ALL_LPS || lp.tier === 1)
+        .map(lp => lp.endpoint);
+    if (CONFIG.SDK_URLS.length === 0) {
+        CONFIG.SDK_URLS = lps.map(lp => lp.endpoint);
+    }
+    updateTierDisplay();
+    connectLPWebSockets();
+}
+
+/**
+ * Connect WS to each discovered LP. Manages lifecycle (close removed, add new).
+ */
+function connectLPWebSockets() {
+    // Connect to ALL registry LPs (not just SDK_URLS) for full Explorer coverage
+    const allEndpoints = CONFIG.LP_REGISTRY.map(lp => lp.endpoint);
+    // Close WS for LPs no longer in the registry
+    for (const url of Object.keys(lpWebSockets)) {
+        if (!allEndpoints.includes(url)) {
+            lpWebSockets[url].close();
+            delete lpWebSockets[url];
+        }
+    }
+    // Connect WS to new LPs
+    for (const url of allEndpoints) {
+        if (lpWebSockets[url]) continue;
+        const wsUrl = url.replace(/^http/, 'ws') + '/ws';
+        const lpWs = new PnaWebSocket(wsUrl, {
+            lp_info: (data) => {
+                currentLP = {
+                    id: data.lp_id,
+                    name: data.name,
+                    pairs: data.pairs,
+                    inventory: data.inventory,
+                };
+                updateLPDisplay();
+                // Cache for LP Explorer
+                if (!lpWsInfoCache[url]) lpWsInfoCache[url] = {};
+                lpWsInfoCache[url].info = data;
+                lpWsInfoCache[url].ts = Date.now();
+                updateLPExplorerCard(url);
+            },
+            quote: (data) => {
+                // WS quote push — update display if matches current pair
+                if (data.from_asset === State.fromAsset && data.to_asset === State.toAsset) {
+                    currentQuote = data;
+                    if (data.to_amount !== undefined) {
+                        State.outputAmount = data.to_amount;
+                        const toAsset = State.toAsset;
+                        if (toAsset === 'BTC') {
+                            DOM.outputAmount.textContent = data.to_amount.toFixed(8);
+                        } else if (toAsset === 'M1') {
+                            DOM.outputAmount.textContent = Math.round(data.to_amount * 100000000).toLocaleString();
+                        } else {
+                            DOM.outputAmount.textContent = formatNumber(data.to_amount, 2);
+                        }
+                        updateQuoteBreakdown(data);
+                        updateButtonState();
+                    }
+                }
+            },
+            swap_update: (data) => {
+                if (State.currentSwap && data.swap_id === State.currentSwap.swap_id) {
+                    handleFlowSwapStateChange(data);
+                }
+            },
+            inventory: (data) => {
+                // Cache inventory for LP Explorer
+                if (!lpWsInfoCache[url]) lpWsInfoCache[url] = {};
+                lpWsInfoCache[url].inventory = data;
+                lpWsInfoCache[url].ts = Date.now();
+                updateLPExplorerCard(url);
+            },
+            error: (data) => {
+                console.warn('[ws] LP error:', data.message);
+            },
+            pong: () => {},
+        });
+        lpWs.connect();
+        // Auto-subscribe to inventory updates
+        lpWs.subscribe('inventory');
+        lpWebSockets[url] = lpWs;
+    }
+}
+
+/**
+ * Subscribe active LP WS to quote updates for current pair.
+ */
+function wsSubscribeQuote() {
+    if (State.inputAmount <= 0) return;
+    const lpUrl = getLpUrl();
+    const lpWs = lpWebSockets[lpUrl];
+    if (lpWs && lpWs.connected) {
+        lpWs.subscribe('quotes', {
+            from: State.fromAsset,
+            to: State.toAsset,
+            amount: State.inputAmount,
+        });
+    }
+}
+
+/**
+ * Subscribe to swap updates via WS (replaces polling).
+ */
+function wsSubscribeSwap(swapId) {
+    const lpUrl = getLpUrl();
+    const lpWs = lpWebSockets[lpUrl];
+    if (lpWs && lpWs.connected) {
+        lpWs.subscribe('swap', { swap_id: swapId });
+        console.log(`[ws] Subscribed to swap ${swapId}`);
+    }
+}
+
 document.addEventListener('DOMContentLoaded', async () => {
     console.log('[pna] Initializing FlowSwap 3S...');
 
-    // Load LP endpoints: try on-chain registry first, fallback to lp-config.json
+    // --- Step 1: Connect to Registry via WebSocket (with HTTP fallback) ---
     let lpSourceLoaded = false;
-    try {
-        const registryResp = await fetch(
-            `${CONFIG.REGISTRY_URL}/api/registry/lps/online`,
-            { signal: AbortSignal.timeout(CONFIG.REGISTRY_TIMEOUT_MS) }
-        );
-        if (registryResp.ok) {
-            const data = await registryResp.json();
+
+    // Race: WS and HTTP in parallel — use whichever responds first
+    const registryWsUrl = CONFIG.REGISTRY_URL.replace(/^http/, 'ws') + '/ws';
+    let wsResolve;
+    const wsReady = new Promise(r => { wsResolve = r; });
+
+    registryWs = new PnaWebSocket(registryWsUrl, {
+        lps: (data) => {
             if (data.lps && data.lps.length > 0) {
-                CONFIG.LP_REGISTRY = data.lps;
-                CONFIG.SDK_URLS = data.lps
-                    .filter(lp => CONFIG.SHOW_ALL_LPS || lp.tier === 1)
-                    .map(lp => lp.endpoint);
-                // If tier filter removed all LPs, include all
-                if (CONFIG.SDK_URLS.length === 0) {
-                    CONFIG.SDK_URLS = data.lps.map(lp => lp.endpoint);
+                applyRegistryLPs(data.lps);
+                if (!lpSourceLoaded) {
+                    lpSourceLoaded = true;
+                    console.log(`[ws] Registry: ${data.lps.length} LPs discovered`);
+                    wsResolve();
+                    // Trigger initial data fetches now that we have LPs
+                    Promise.allSettled([
+                        fetchLPInfo(),
+                        updateRateDisplay(),
+                        loadSwapExplorer(),
+                    ]).then(() => updateButtonState());
                 }
-                lpSourceLoaded = true;
-                console.log(`[pna] Registry: ${data.lps.length} LPs discovered (${CONFIG.SDK_URLS.length} active)`);
-                updateTierDisplay();
             }
+        },
+        lp_update: (data) => {
+            const idx = CONFIG.LP_REGISTRY.findIndex(lp => lp.endpoint === data.endpoint);
+            if (idx >= 0) CONFIG.LP_REGISTRY[idx] = data;
+            else CONFIG.LP_REGISTRY.push(data);
+            CONFIG.SDK_URLS = CONFIG.LP_REGISTRY
+                .filter(lp => (CONFIG.SHOW_ALL_LPS || lp.tier === 1) && lp.status !== 'offline')
+                .map(lp => lp.endpoint);
+            if (CONFIG.SDK_URLS.length === 0) {
+                CONFIG.SDK_URLS = CONFIG.LP_REGISTRY.map(lp => lp.endpoint);
+            }
+            updateTierDisplay();
+            connectLPWebSockets();
+            // Live-update LP Explorer card
+            if (State._lpExplorerLoaded && data.endpoint) {
+                updateLPExplorerCard(data.endpoint);
+                updateLPExplorerSummary();
+            }
+        },
+        pong: () => {},
+    });
+    registryWs.connect();
+
+    // HTTP fetch fires immediately in parallel with WS
+    const httpFetch = (async () => {
+        try {
+            const registryResp = await fetch(
+                `${CONFIG.REGISTRY_URL}/api/registry/lps/online`,
+                { signal: AbortSignal.timeout(CONFIG.REGISTRY_TIMEOUT_MS) }
+            );
+            if (registryResp.ok && !lpSourceLoaded) {
+                const data = await registryResp.json();
+                if (data.lps && data.lps.length > 0 && !lpSourceLoaded) {
+                    applyRegistryLPs(data.lps);
+                    lpSourceLoaded = true;
+                    console.log(`[pna] Registry HTTP: ${data.lps.length} LPs discovered`);
+                }
+            }
+        } catch (e) {
+            console.warn('[pna] Registry HTTP failed:', e.message);
         }
-    } catch (e) {
-        console.warn('[pna] Registry unavailable:', e.message);
-    }
-    // No fallback — LPs are discovered on-chain only via registry
+    })();
+
+    // Wait for whichever responds first (WS or HTTP), max 2s
+    await Promise.race([
+        wsReady,
+        httpFetch,
+        new Promise(r => setTimeout(r, 2000)),
+    ]);
+
     if (!lpSourceLoaded) {
-        console.warn('[pna] Registry unavailable and no LPs discovered. Retrying in 5s...');
-        setTimeout(() => initLPEndpoints(), 5000);
+        console.warn('[pna] No LPs discovered yet. Waiting for WS reconnect...');
     }
 
     // Show loading state
     DOM.rateValue.textContent = 'Loading...';
     updateAssetDisplay();
 
-    // Run all startup fetches in parallel (no dependencies between them)
-    await Promise.allSettled([
-        fetchLPInfo(),
-        updateRateDisplay(),
-        loadSwapExplorer(),
-    ]);
-    updateButtonState();
+    // If we have LPs from HTTP fallback, fetch data now
+    if (lpSourceLoaded) {
+        await Promise.allSettled([
+            fetchLPInfo(),
+            updateRateDisplay(),
+            loadSwapExplorer(),
+        ]);
+        updateButtonState();
+    }
 
-    // Refresh rates periodically (pause during active swap)
+    // --- Step 1.5: Recover in-flight swap from sessionStorage ---
+    const savedSession = loadSwapSession();
+    if (savedSession) {
+        console.log('[pna] Recovering swap from session:', savedSession.swap.swap_id);
+        State.S_user = savedSession.S_user;
+        State.currentSwap = savedSession.swap;
+        State.activeLpUrl = savedSession.lpUrl;
+
+        // Re-open the swap modal and start polling
+        DOM.swapModal.classList.remove('hidden');
+        DOM.swapId.textContent = savedSession.swap.swap_id;
+        setStatusMessage('pending', 'Recovering swap...');
+
+        // Poll LP for current state
+        startFlowSwapPolling(savedSession.swap.swap_id);
+
+        // Fetch current state immediately
+        try {
+            const lpUrl = savedSession.lpUrl || getLpUrl();
+            const resp = await fetch(`${lpUrl}/api/flowswap/${savedSession.swap.swap_id}`);
+            if (resp.ok) {
+                const data = await resp.json();
+                handleFlowSwapStateChange(data);
+                console.log('[pna] Swap recovered, state:', data.state);
+            } else {
+                setStatusMessage('warning', 'Swap recovery: LP not responding. Polling...');
+            }
+        } catch (e) {
+            console.warn('[pna] Swap recovery fetch error:', e);
+            setStatusMessage('warning', 'Reconnecting to LP...');
+        }
+    }
+
+    // --- Step 2: Periodic fallback for quotes (when WS unavailable) ---
     setInterval(async () => {
         if (State.currentSwap) return;
+        // Check if any LP WS is connected — if so, use WS for quotes
+        const lpUrl = getLpUrl();
+        const lpWs = lpWebSockets[lpUrl];
+        if (lpWs && lpWs.connected) {
+            // WS handles quote pushes — just update subscription if pair changed
+            wsSubscribeQuote();
+            return;
+        }
+        // HTTP fallback
         if (State.inputAmount > 0) {
-            await onInputChange(true);  // silent refresh: no flash
+            await onInputChange(true);
         } else {
             await updateRateDisplay();
         }
@@ -2639,5 +3336,5 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (State._lpExplorerLoaded) loadLPExplorer();
     }, 30000);
 
-    console.log('[pna] Ready - FlowSwap 3S - Connected to', currentLP.name);
+    console.log('[pna] Ready - FlowSwap 3S');
 });
