@@ -61,6 +61,8 @@ const ASSETS = {
         color: '#008ce7',
         addressPattern: /^[yY][a-zA-HJ-NP-Z0-9]{25,34}$/,
         addressPlaceholder: 'y...',
+        disabled: true,
+        disabledReason: 'Coming soon',
     },
     ZEC: {
         symbol: 'ZEC',
@@ -171,6 +173,7 @@ const State = {
     activeLpUrl: null,   // Selected LP URL for current swap
     routeType: null,     // 'full' or 'perleg'
     routeLegs: null,     // { leg1: {..., _url}, leg2: {..., _url} } when perleg
+    _lpExplorerLoaded: false, // LP explorer lazy-load flag
 };
 
 /**
@@ -847,7 +850,7 @@ function updateTierDisplay() {
         lp => lp.endpoint === (State.activeLpUrl || CONFIG.SDK_URLS[0])
     );
     if (activeLp && activeLp.tier === 1) {
-        badge.textContent = 'MN Verified';
+        badge.textContent = 'Operator';
         badge.className = 'tier-badge tier-1';
         badge.style.display = 'inline-block';
     } else if (activeLp) {
@@ -2368,6 +2371,124 @@ function formatExplorerDuration(sec) {
 window.toggleExplorerDetail = toggleExplorerDetail;
 
 // =============================================================================
+// TAB NAVIGATION
+// =============================================================================
+
+function switchTab(tabId) {
+    // Update buttons
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.tab === tabId);
+    });
+    // Update content
+    document.querySelectorAll('.tab-content').forEach(panel => {
+        panel.classList.toggle('active', panel.id === `tab-${tabId}`);
+    });
+    // Lazy-load LP explorer on first visit
+    if (tabId === 'lps' && !State._lpExplorerLoaded) {
+        State._lpExplorerLoaded = true;
+        loadLPExplorer();
+    }
+}
+
+window.switchTab = switchTab;
+
+// =============================================================================
+// LP EXPLORER
+// =============================================================================
+
+async function loadLPExplorer() {
+    const container = document.getElementById('lp-explorer-list');
+    if (!container) return;
+
+    if (CONFIG.LP_REGISTRY.length === 0) {
+        container.innerHTML = '<div class="explorer-empty">No LPs discovered yet. LPs register on-chain via OP_RETURN transactions.</div>';
+        return;
+    }
+
+    // Update summary
+    const summary = document.getElementById('lp-explorer-summary');
+    if (summary) {
+        const online = CONFIG.LP_REGISTRY.filter(lp => lp.status === 'online' || lp.status === 'new').length;
+        const tier1 = CONFIG.LP_REGISTRY.filter(lp => lp.tier === 1).length;
+        summary.textContent = `${CONFIG.LP_REGISTRY.length} registered \u00b7 ${online} online \u00b7 ${tier1} operator-backed`;
+    }
+
+    // Fetch /api/lp/info from each LP in parallel for live data
+    const infoResults = await Promise.allSettled(
+        CONFIG.LP_REGISTRY.map(lp =>
+            fetch(`${lp.endpoint}/api/lp/info`, { signal: AbortSignal.timeout(CONFIG.LP_TIMEOUT_MS) })
+                .then(r => r.ok ? r.json() : null)
+                .catch(() => null)
+        )
+    );
+
+    container.innerHTML = CONFIG.LP_REGISTRY.map((lp, i) => {
+        const info = infoResults[i]?.status === 'fulfilled' ? infoResults[i].value : null;
+        const cached = lp.cached_info || {};
+
+        const name = info?.name || cached?.lp_id || lp.address?.slice(0, 12) || 'Unknown LP';
+        const status = lp.status || 'offline';
+        const tier = lp.tier || 2;
+        const tierLabel = tier === 1 ? 'Operator' : 'Community';
+        const tierClass = tier === 1 ? 'tier-1' : 'tier-2';
+
+        // Pairs from live info
+        const pairs = info?.pairs ? Object.keys(info.pairs) : [];
+        const pairPills = pairs.map(p => `<span class="lp-pair-pill">${p}</span>`).join('');
+
+        // Inventory from live info (boolean flags)
+        const inv = info?.inventory || {};
+        const invItems = ['btc', 'm1', 'usdc'].map(asset => {
+            const avail = inv[asset] ? 'available' : 'unavailable';
+            return `<span class="lp-inv-item"><span class="lp-inv-dot ${avail}"></span>${asset.toUpperCase()}</span>`;
+        }).join('');
+
+        // Stats from cached_info (registry health check)
+        const rep = cached?.reputation || {};
+        const totalSwaps = cached?.swaps_total || 0;
+        const successRate = rep.success_rate != null ? Math.round(rep.success_rate * 100) : '-';
+        const version = cached?.version || '-';
+
+        // Detail section
+        const addrShort = lp.address ? `${lp.address.slice(0, 8)}...${lp.address.slice(-4)}` : '-';
+        const addrFull = lp.address || '';
+        const txidShort = lp.txid ? `${lp.txid.slice(0, 12)}...${lp.txid.slice(-4)}` : '-';
+
+        return `
+        <div class="lp-card" onclick="toggleLPDetail(this)">
+            <div class="lp-header">
+                <span class="lp-status-dot ${status}"></span>
+                <span class="lp-name">${name}</span>
+                <span class="tier-badge ${tierClass}">${tierLabel}</span>
+                <span class="lp-status-label">${status}</span>
+            </div>
+            ${pairPills ? `<div class="lp-pairs">${pairPills}</div>` : ''}
+            <div class="lp-inventory">${invItems}</div>
+            <div class="lp-stats">
+                <span>${totalSwaps} swap${totalSwaps !== 1 ? 's' : ''}</span>
+                <span class="lp-stat-sep">\u00b7</span>
+                <span>${successRate}% success</span>
+                <span class="lp-stat-sep">\u00b7</span>
+                <span>v${version}</span>
+            </div>
+            <div class="lp-detail hidden">
+                <div class="lp-detail-row"><span>Address</span><code title="${addrFull}">${addrShort}</code></div>
+                <div class="lp-detail-row"><span>Endpoint</span><a href="${lp.endpoint}" target="_blank" rel="noopener">${lp.endpoint}</a></div>
+                ${lp.txid ? `<div class="lp-detail-row"><span>Reg TX</span><code title="${lp.txid}">${txidShort}</code></div>` : ''}
+                ${lp.height ? `<div class="lp-detail-row"><span>Registered</span><span>Block ${lp.height}</span></div>` : ''}
+            </div>
+        </div>`;
+    }).join('');
+}
+
+function toggleLPDetail(el) {
+    const detail = el.querySelector('.lp-detail');
+    if (detail) detail.classList.toggle('hidden');
+}
+
+window.toggleLPDetail = toggleLPDetail;
+
+// =============================================================================
 // UTILITIES
 // =============================================================================
 
@@ -2484,20 +2605,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     } catch (e) {
         console.warn('[pna] Registry unavailable:', e.message);
     }
-    // Fallback: lp-config.json
+    // No fallback — LPs are discovered on-chain only via registry
     if (!lpSourceLoaded) {
-        try {
-            const resp = await fetch('lp-config.json', { signal: AbortSignal.timeout(2000) });
-            if (resp.ok) {
-                const lpConfig = await resp.json();
-                if (lpConfig.lp_endpoints && lpConfig.lp_endpoints.length > 0) {
-                    CONFIG.SDK_URLS = lpConfig.lp_endpoints.map(lp => lp.url);
-                    console.log('[pna] LP endpoints loaded from config:', CONFIG.SDK_URLS);
-                }
-            }
-        } catch (e) {
-            console.warn('[pna] Could not load lp-config.json, using defaults:', e.message);
-        }
+        console.warn('[pna] Registry unavailable and no LPs discovered. Retrying in 5s...');
+        setTimeout(() => initLPEndpoints(), 5000);
     }
 
     // Show loading state
@@ -2522,8 +2633,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     }, CONFIG.QUOTE_REFRESH_MS);
 
-    // Refresh explorer every 30s
+    // Refresh explorers every 30s
     setInterval(loadSwapExplorer, 30000);
+    setInterval(() => {
+        if (State._lpExplorerLoaded) loadLPExplorer();
+    }, 30000);
 
     console.log('[pna] Ready - FlowSwap 3S - Connected to', currentLP.name);
 });
