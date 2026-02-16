@@ -216,7 +216,7 @@ function loadSwapSession() {
         if (!raw) return null;
         const session = JSON.parse(raw);
         // Expire after 2 hours (max HTLC lifetime)
-        if (Date.now() - session.ts > 2 * 60 * 60 * 1000) {
+        if (Date.now() - session.ts > 4 * 60 * 60 * 1000) {
             sessionStorage.removeItem('pna_swap_session');
             return null;
         }
@@ -644,10 +644,12 @@ async function swapDirection() {
         State.outputAmount = newOutput;
 
         if (currentQuote && currentQuote.error === 'min') {
-            DOM.outputAmount.textContent = `Min: ${formatNumber(currentQuote.minAmount, 2)} ${currentQuote.asset}`;
+            const minDec = currentQuote.asset === 'BTC' ? 8 : 2;
+            DOM.outputAmount.textContent = `Min: ${formatNumber(currentQuote.minAmount, minDec)} ${currentQuote.asset}`;
             updateQuoteBreakdown(null);
         } else if (currentQuote && currentQuote.error === 'max') {
-            DOM.outputAmount.textContent = `Max: ${formatNumber(currentQuote.maxAmount, 2)} ${currentQuote.asset}`;
+            const maxDec = currentQuote.asset === 'BTC' ? 8 : 2;
+            DOM.outputAmount.textContent = `Max: ${formatNumber(currentQuote.maxAmount, maxDec)} ${currentQuote.asset}`;
             updateQuoteBreakdown(null);
         } else {
             updateOutputDisplay();
@@ -1278,13 +1280,15 @@ async function onInputChange(silent = false) {
 
             // Check for errors (min/max)
             if (currentQuote && currentQuote.error === 'min') {
-                DOM.outputAmount.textContent = `Min: ${formatNumber(currentQuote.minAmount, 2)} ${currentQuote.asset}`;
+                const minDec = currentQuote.asset === 'BTC' ? 8 : 2;
+                DOM.outputAmount.textContent = `Min: ${formatNumber(currentQuote.minAmount, minDec)} ${currentQuote.asset}`;
                 updateQuoteBreakdown(null);
                 updateButtonState();
                 return;
             }
             if (currentQuote && currentQuote.error === 'max') {
-                DOM.outputAmount.textContent = `Max: ${formatNumber(currentQuote.maxAmount, 2)} ${currentQuote.asset}`;
+                const maxDec = currentQuote.asset === 'BTC' ? 8 : 2;
+                DOM.outputAmount.textContent = `Max: ${formatNumber(currentQuote.maxAmount, maxDec)} ${currentQuote.asset}`;
                 updateQuoteBreakdown(null);
                 updateButtonState();
                 return;
@@ -2756,7 +2760,7 @@ function buildLPCardHTML(lp) {
     // Pair pills — use WS info, fallback to registry cached_info
     const pairsObj = info?.pairs || cached?.pairs || {};
     const pairs = Object.keys(pairsObj);
-    const pairPills = pairs.map(p => `<span class="lp-pair-pill">${p}</span>`).join('');
+    const pairPills = pairs.map(p => `<span class="lp-pair-pill">${escapeHtml(p)}</span>`).join('');
 
     // Inventory dots — derive assets from LP's pairs
     const inv = info?.inventory || cached?.inventory || {};
@@ -2774,13 +2778,13 @@ function buildLPCardHTML(lp) {
         : '<span class="lp-http-tag">HTTP</span>';
 
     return `
-    <div class="lp-card" data-lp-endpoint="${lp.endpoint}" onclick="openLPDetail('${lp.endpoint}')">
+    <div class="lp-card" data-lp-endpoint="${escapeHtml(lp.endpoint)}" onclick="openLPDetail('${escapeHtml(lp.endpoint)}')">
         <div class="lp-header">
-            <span class="lp-status-dot ${status}"></span>
-            <span class="lp-name">${name}</span>
+            <span class="lp-status-dot ${escapeHtml(status)}"></span>
+            <span class="lp-name">${escapeHtml(name)}</span>
             ${connTag}
             <span class="tier-badge ${tierClass}">${tierLabel}</span>
-            <span class="lp-status-label">${status}</span>
+            <span class="lp-status-label">${escapeHtml(status)}</span>
         </div>
         ${pairPills ? `<div class="lp-pairs">${pairPills}</div>` : ''}
         <div class="lp-inventory">${invDots}</div>
@@ -2856,10 +2860,10 @@ function buildLPDetailHTML(lp, info, liveInv, cached, wsConnected) {
     let statusHTML = `
     <div class="lpd-status-bar">
         <span class="lp-status-dot ${status}"></span>
-        <span class="lpd-status-text">${status}</span>
+        <span class="lpd-status-text">${escapeHtml(status)}</span>
         <span class="tier-badge ${tierClass}">${tierLabel}</span>
         ${wsConnected ? '<span class="lp-live-tag">LIVE</span>' : '<span class="lpd-no-ws">HTTP</span>'}
-        <span class="lpd-version">v${version}</span>
+        <span class="lpd-version">v${escapeHtml(version)}</span>
     </div>`;
 
     // --- LP-level stats ---
@@ -2897,7 +2901,7 @@ function buildLPDetailHTML(lp, info, liveInv, cached, wsConnected) {
                 : '';
 
             return `<tr>
-                <td class="lpd-pair-name">${pairKey}</td>
+                <td class="lpd-pair-name">${escapeHtml(pairKey)}</td>
                 <td class="lpd-rate-bid">${formatRateNum(p.rate_bid)}</td>
                 <td class="lpd-rate-ask">${formatRateNum(p.rate_ask)}</td>
                 <td class="lpd-minmax">${minVal}</td>
@@ -2930,9 +2934,9 @@ function buildLPDetailHTML(lp, info, liveInv, cached, wsConnected) {
     <div class="lpd-section">
         <h4 class="lpd-section-title">On-chain</h4>
         <div class="lpd-kv-list">
-            <div class="lpd-kv"><span class="lpd-k">Address</span><code class="lpd-v">${addrFull}</code></div>
-            <div class="lpd-kv"><span class="lpd-k">Endpoint</span><a href="${lp.endpoint}" target="_blank" rel="noopener" class="lpd-v">${lp.endpoint}</a></div>
-            ${lp.txid ? `<div class="lpd-kv"><span class="lpd-k">Registration TX</span><code class="lpd-v">${lp.txid}</code></div>` : ''}
+            <div class="lpd-kv"><span class="lpd-k">Address</span><code class="lpd-v">${escapeHtml(addrFull)}</code></div>
+            <div class="lpd-kv"><span class="lpd-k">Endpoint</span><a href="${escapeHtml(lp.endpoint)}" target="_blank" rel="noopener" class="lpd-v">${escapeHtml(lp.endpoint)}</a></div>
+            ${lp.txid ? `<div class="lpd-kv"><span class="lpd-k">Registration TX</span><code class="lpd-v">${escapeHtml(lp.txid)}</code></div>` : ''}
             ${lp.height ? `<div class="lpd-kv"><span class="lpd-k">Registered at</span><span class="lpd-v">Block ${lp.height}</span></div>` : ''}
         </div>
     </div>`;
@@ -2980,6 +2984,14 @@ window.openLPDetail = openLPDetail;
 // =============================================================================
 // UTILITIES
 // =============================================================================
+
+/** Escape HTML to prevent XSS from LP-provided data. */
+function escapeHtml(str) {
+    if (str == null) return '';
+    const div = document.createElement('div');
+    div.textContent = String(str);
+    return div.innerHTML;
+}
 
 function formatNumber(num, decimals = 2) {
     if (num >= 1000000) {
