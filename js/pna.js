@@ -215,8 +215,8 @@ function loadSwapSession() {
         const raw = sessionStorage.getItem('pna_swap_session');
         if (!raw) return null;
         const session = JSON.parse(raw);
-        // Expire after 2 hours (max HTLC lifetime)
-        if (Date.now() - session.ts > 4 * 60 * 60 * 1000) {
+        // Expire after 2 hours (aligned with shortest HTLC timelock)
+        if (Date.now() - session.ts > 2 * 60 * 60 * 1000) {
             sessionStorage.removeItem('pna_swap_session');
             return null;
         }
@@ -1123,16 +1123,22 @@ async function updateRateDisplay() {
                 const inv = 1 / r;
                 return `1 ${to}=${formatNumber(inv, 0)} ${from}`;
             }
+            // Sanitize LP names to prevent XSS from malicious LP endpoints
+            const esc = (s) => {
+                const d = document.createElement('div');
+                d.textContent = s;
+                return d.innerHTML;
+            };
             DOM.routeValue.innerHTML =
                 `<div class="route-leg">` +
-                    `<span class="route-leg-pair">${l1.from_asset} \u2192 ${l1.to_asset}</span>` +
-                    `<span class="route-leg-lp">${l1.lp_name}</span>` +
-                    `<span class="route-leg-rate">${fmtLegRate(r1, l1.from_asset, l1.to_asset)}</span>` +
+                    `<span class="route-leg-pair">${esc(l1.from_asset)} \u2192 ${esc(l1.to_asset)}</span>` +
+                    `<span class="route-leg-lp">${esc(l1.lp_name)}</span>` +
+                    `<span class="route-leg-rate">${esc(fmtLegRate(r1, l1.from_asset, l1.to_asset))}</span>` +
                 `</div>` +
                 `<div class="route-leg">` +
-                    `<span class="route-leg-pair">${l2.from_asset} \u2192 ${l2.to_asset}</span>` +
-                    `<span class="route-leg-lp">${l2.lp_name}</span>` +
-                    `<span class="route-leg-rate">${fmtLegRate(r2, l2.from_asset, l2.to_asset)}</span>` +
+                    `<span class="route-leg-pair">${esc(l2.from_asset)} \u2192 ${esc(l2.to_asset)}</span>` +
+                    `<span class="route-leg-lp">${esc(l2.lp_name)}</span>` +
+                    `<span class="route-leg-rate">${esc(fmtLegRate(r2, l2.from_asset, l2.to_asset))}</span>` +
                 `</div>`;
         } else {
             DOM.routeValue.textContent = quote.route;
